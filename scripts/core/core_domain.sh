@@ -1,121 +1,218 @@
 #!/bin/bash
 # ============================================================================
-# Core Script: Domain Configuration
-# SeederLinux Lite - Ingresso em Dominio AD
+# Core Script: core_domain.sh
+# SeederLinux Lite - Ingresso no AD (SSSD/Winbind)
 # ============================================================================
-# This script joins the Linux station to an Active Directory domain using
-# SSSD/realmd, configures sudoers for AD groups, and sets up PAM for
-# automatic home directory creation.
-#
-# Placeholders (replaced by SeederLinux Lite at bundle generation time):
-#   {{DOMINIO}}            - Full AD domain name (e.g., comara.intraer)
-#   {{DOMINIO_NETBIOS}}    - NetBIOS domain name (e.g., COMARA)
-#   {{DC_IP}}              - IP of the Domain Controller
-#   {{DNS_INTERNET}}       - Fallback DNS for internet resolution
-#   {{GRUPO_ADMIN_AD}}     - AD admin group for sudo
-#   {{GRUPO_ADMIN_LINUX}}  - Local Linux admin group for sudo
-#   {{GRUPO_DASTI}}        - DASTI group for passwordless sudo
+# Configura Kerberos, Samba, SSSD, PAM, NSS, sudo e mkhomedir para
+# ingressar a estacao no dominio Active Directory.
+# Os placeholders {{VARIAVEL}} são substituídos automaticamente
+# pelo sistema na geração do bundle.
 # ============================================================================
 
 set -e
 
 echo "============================================================"
-echo "CONFIGURANDO DOMÍNIO E AUTENTICAÇÃO"
+echo "04 - Ingresso no Active Directory"
 echo "============================================================"
 
-# Variaveis de dominio
+# ============================================================
+# Variáveis
+# ============================================================
 DOMINIO="{{DOMINIO}}"
 DOMINIO_NETBIOS="{{DOMINIO_NETBIOS}}"
 DC_IP="{{DC_IP}}"
-DNS_INTERNET="{{DNS_INTERNET}}"
+DC_IP_LIST="{{DC_IP_LIST}}"
+OU_PADRAO="{{OU_PADRAO}}"
+GRUPO_ADMIN="{{GRUPO_ADMIN}}"
 GRUPO_ADMIN_AD="{{GRUPO_ADMIN_AD}}"
 GRUPO_ADMIN_LINUX="{{GRUPO_ADMIN_LINUX}}"
 GRUPO_DASTI="{{GRUPO_DASTI}}"
+OFFLINE_AUTH_ENABLED="{{OFFLINE_AUTH_ENABLED}}"
+OFFLINE_AUTH_DAYS="{{OFFLINE_AUTH_DAYS}}"
+ADMIN_USERNAME="{{ADMIN_USERNAME}}"
 
-echo ">>> Domínio: $DOMINIO ($DOMINIO_NETBIOS)"
-echo ">>> Controlador: $DC_IP"
+echo ">>> Dominio: $DOMINIO"
+echo ">>> NetBIOS: $DOMINIO_NETBIOS"
+echo ">>> DC principal: $DC_IP"
 
-# Verificar se o hostname esta correto
-CURRENT_HOSTNAME=$(hostname)
-echo ">>> Hostname atual: $CURRENT_HOSTNAME"
+# ============================================================
+# Configurar Kerberos
+# ============================================================
+echo ">>> Configurando Kerberos..."
+cat > /etc/krb5.conf <<EOF
+[libdefaults]
+    default_realm = ${DOMINIO_NETBIOS}
+    dns_lookup_realm = false
+    dns_lookup_kdc = true
+    rdns = false
+    ticket_lifetime = 24h
+    forwardable = yes
+    renew_lifetime = 7d
 
-# Instalar pacotes necessarios
-echo ">>> Instalando pacotes de autenticacao..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq sssd sssd-ad adcli realmd krb5-user packagekit
+[realms]
+    ${DOMINIO_NETBIOS} = {
+        kdc = ${DC_IP}
+        admin_server = ${DC_IP}
+    }
 
-# Configurar DNS para resolver o dominio
-echo ">>> Configurando DNS para dominio..."
-sudo cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+[domain_realm]
+    .${DOMINIO} = ${DOMINIO_NETBIOS}
+    ${DOMINIO} = ${DOMINIO_NETBIOS}
+EOF
 
-# Preparar ingresso no dominio
-echo ">>> Preparando ingresso no domínio..."
-echo "Por favor, forneça as credenciais do administrador do domínio quando solicitado."
+echo ">>> Kerberos configurado"
 
-# Descobrir realm
-echo ">>> Descobrindo realm..."
-sudo realm discover "$DOMINIO" || echo "Aviso: Não foi possível descobrir o realm via DNS"
+# ============================================================
+# Configurar Samba
+# ============================================================
+echo ">>> Configurando Samba..."
+cat > /etc/samba/smb.conf <<EOF
+[global]
+    workgroup = ${DOMINIO_NETBIOS}
+    realm = ${DOMINIO}
+    security = ads
+    dns forwarder = ${DC_IP}
+    idmap config * : backend = tdb
+    idmap config * : range = 3000-7999
+    idmap config ${DOMINIO_NETBIOS} : backend = rid
+    idmap config ${DOMINIO_NETBIOS} : range = 10000-999999
+    template shell = /bin/bash
+    template homedir = /home/%D/%U
+    winbind use default domain = true
+    winbind offline logon = false
+    winbind nss info = rfc2307
+    winbind enum users = no
+    winbind enum groups = no
+    load printers = no
+    printing = bsd
+    printcap name = /dev/null
+    disable spoolss = yes
+EOF
 
+echo ">>> Samba configurado"
+
+# ============================================================
 # Ingressar no dominio
+# ============================================================
 echo ">>> Ingressando no dominio..."
-sudo realm join "$DOMINIO" --user=admin || {
-    echo "Tentando ingresso com usuario especifico..."
-    sudo realm join "$DOMINIO" --user=Administrator
+# Obter ticket Kerberos (requer senha de admin do dominio)
+echo ">>> Solicitando ticket Kerberos..."
+kinit "${ADMIN_USERNAME}@${DOMINIO_NETBIOS}" || {
+    echo ">>> AVISO: Falha ao obter ticket Kerberos."
+    echo ">>> Verifique as credenciais e conectividade com o DC."
+    exit 1
 }
 
+# Ingressar com net ads join
+net ads join -U "${ADMIN_USERNAME}@${DOMINIO_NETBIOS}" \
+    createcomputer="${OU_PADRAO}" || {
+    echo ">>> ERRO: Falha ao ingressar no dominio"
+    exit 1
+}
+echo ">>> Ingresso no dominio realizado"
+
+# ============================================================
 # Configurar SSSD
+# ============================================================
 echo ">>> Configurando SSSD..."
-sudo tee /etc/sssd/sssd.conf > /dev/null <<EOF
+OFFLINE_CACHE=""
+if [ "$OFFLINE_AUTH_ENABLED" = "true" ]; then
+    DAYS="${OFFLINE_AUTH_DAYS:-3}"
+    OFFLINE_CACHE="cache_credentials = true
+    krb5_store_password_if_offline = true
+    offline_credentials_expiration = ${DAYS}"
+fi
+
+cat > /etc/sssd/sssd.conf <<EOF
 [sssd]
-domains = $DOMINIO
-services = nss, pam
+services = nss, pam, sudo
+config_file_version = 2
+domains = ${DOMINIO}
 
-[domain/$DOMINIO]
-ad_domain = $DOMINIO
-ad_server = $DC_IP
-ad_hostname = $(hostname).$DOMINIO
-krb5_realm = $(echo $DOMINIO | tr '[:lower:]' '[:upper:]')
-realmd_tags = manages-system joined-with-adcli
-cache_credentials = True
-id_provider = ad
-auth_provider = ad
-chpass_provider = ad
-access_provider = ad
-ldap_id_mapping = True
-use_fully_qualified_names = False
-fallback_homedir = /home/%u@%d
-simple_allow_groups = $GRUPO_ADMIN_AD, $GRUPO_ADMIN_LINUX, $GRUPO_DASTI
-dyndns_update = True
-dyndns_refresh_interval = 43200
-dyndns_update_ptr = True
+[domain/${DOMINIO}]
+    id_provider = ad
+    ad_domain = ${DOMINIO}
+    ad_server = ${DC_IP}
+    ad_hostname = $(hostname).${DOMINIO}
+    ldap_id_mapping = true
+    enumerate = false
+    use_fully_qualified_names = false
+    fallback_homedir = /home/%d/%u
+    default_shell = /bin/bash
+    ${OFFLINE_CACHE}
+    dyndns_update = false
+    sudo_provider = ad
+    ldap_sudo_search_base = OU=sudoers,${OU_PADRAO}
 EOF
 
-sudo chmod 600 /etc/sssd/sssd.conf
-sudo systemctl enable sssd
-sudo systemctl restart sssd
+chmod 600 /etc/sssd/sssd.conf
+echo ">>> SSSD configurado"
 
-# Configurar sudoers para grupos AD
-echo ">>> Configurando sudoers para grupos do domínio..."
-sudo tee /etc/sudoers.d/domain_admins > /dev/null <<EOF
-# Admins do dominio tem acesso sudo
-%$GRUPO_ADMIN_AD ALL=(ALL) ALL
-%$GRUPO_ADMIN_LINUX ALL=(ALL) ALL
-%$GRUPO_DASTI ALL=(ALL) NOPASSWD: ALL
+# ============================================================
+# Configurar NSS
+# ============================================================
+echo ">>> Configurando NSS..."
+cat > /etc/nsswitch.conf <<EOF
+passwd:     files systemd sss
+shadow:     files sss
+group:      files systemd sss
+gshadow:    files
 
-# Membros do dominio podem montar/desmontar
-%${DOMINIO_NETBIOS}\\domain\ users ALL=/sbin/mount,/sbin/umount
+hosts:      files dns
+
+services:   files sss
+netgroup:   files sss
+sudoers:    files sss
+
+automount:  files sss
 EOF
 
-sudo chmod 440 /etc/sudoers.d/domain_admins
+echo ">>> NSS configurado"
 
-# Configurar PAM para criar home automaticamente
-echo ">>> Configurando PAM para criação automática de home..."
-sudo sed -i '/^[^#]*pam_mkhomedir.so/s/^#//' /etc/pam.d/common-session
-echo "session required pam_mkhomedir.so skel=/etc/skel/ umask=0077" | sudo tee -a /etc/pam.d/common-session
+# ============================================================
+# Configurar PAM (mkhomedir)
+# ============================================================
+echo ">>> Configurando PAM e mkhomedir..."
+pam-auth-update --enable mkhomedir --force 2>/dev/null || true
 
-# Verificar conexao
-echo ">>> Verificando conexao com dominio..."
-id admin@${DOMINIO,,} 2>/dev/null || echo "Aviso: Não foi possível verificar o usuario admin"
+# Garantir criacao automatica do home
+if [ -f /etc/pam.d/common-session ]; then
+    grep -q "pam_mkhomedir" /etc/pam.d/common-session || \
+        echo "session required pam_mkhomedir.so skel=/etc/skel umask=0022" >> /etc/pam.d/common-session
+fi
 
-echo ">>> Configuração de domínio concluída!"
+echo ">>> PAM configurado"
+
+# ============================================================
+# Configurar sudo para grupos do dominio
+# ============================================================
+echo ">>> Configurando sudo..."
+SUDO_FILE="/etc/sudoers.d/seederlinux-domain"
+cat > "$SUDO_FILE" <<EOF
+# SeederLinux - Acesso sudo para grupos do dominio
+%${GRUPO_ADMIN_AD}    ALL=(ALL:ALL) ALL
+%${GRUPO_ADMIN_LINUX}  ALL=(ALL:ALL) ALL
+EOF
+
+if [ -n "$GRUPO_DASTI" ] && [ "$GRUPO_DASTI" != "" ]; then
+    echo "%${GRUPO_DASTI}    ALL=(ALL:ALL) ALL" >> "$SUDO_FILE"
+fi
+
+chmod 440 "$SUDO_FILE"
+visudo -cf "$SUDO_FILE" || {
+    echo ">>> ERRO: sintaxe do sudoers invalida"
+    exit 1
+}
+
+echo ">>> Sudo configurado"
+
+# ============================================================
+# Reiniciar servicos
+# ============================================================
+echo ">>> Reiniciando servicos..."
+systemctl restart samba 2>/dev/null || true
+systemctl restart sssd
+systemctl enable sssd
+
+echo ">>> [04] Ingresso no AD concluido!"
 echo "============================================================"
