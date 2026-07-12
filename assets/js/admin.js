@@ -52,6 +52,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         applyRolePermissions();
         await loadDashboard();
         await loadOrganizations();
+
+        if (currentUser.role === 'operador_om' && currentUser.organization_id) {
+            selectOrganization(currentUser.organization_id);
+        }
+
         setupEventListeners();
     } catch (e) {
         console.error('Init error:', e);
@@ -74,12 +79,17 @@ function applyRolePermissions() {
         const el = document.getElementById(id);
         if (el) el.classList.toggle('hidden', role !== 'admin_gap' && role !== 'auditor');
     });
+
+    if (role === 'operador_om') {
+        const navOrgs = document.querySelector('.nav-item[data-view="organizations"]');
+        if (navOrgs) navOrgs.classList.add('hidden');
+    }
 }
 
 // ============ VIEW MANAGEMENT ============
 
 function showView(viewName) {
-    ['view-dashboard', 'view-om-detail', 'view-scripts-core', 'view-users', 'view-stations', 'view-audit'].forEach(id => {
+    ['view-dashboard', 'view-organizations', 'view-om-detail', 'view-scripts-core', 'view-users', 'view-stations', 'view-audit'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.classList.add('hidden');
     });
@@ -91,6 +101,7 @@ function showView(viewName) {
 
     const titles = {
         dashboard: ['Dashboard', 'Visao geral do sistema'],
+        organizations: ['Organizacoes', 'Todas as organizacoes militares'],
         'scripts-core': ['Scripts Core', 'Scripts do sistema'],
         users: ['Usuarios', 'Gerenciamento de usuarios'],
         stations: ['Estacoes', 'Maquinas registradas'],
@@ -107,6 +118,7 @@ function showView(viewName) {
 
     switch (viewName) {
         case 'dashboard': loadDashboard(); break;
+        case 'organizations': loadOrganizationsDashboard(); break;
         case 'users': loadUsers(); break;
         case 'scripts-core': loadAllScripts(); break;
         case 'stations': loadStations(); break;
@@ -273,6 +285,11 @@ async function loadOrganizations() {
     if (!res.success) return;
 
     organizations = res.data;
+
+    if (currentUser?.role === 'operador_om' && currentUser.organization_id) {
+        organizations = organizations.filter(o => o.id === currentUser.organization_id);
+    }
+
     const el = document.getElementById('om-list');
     if (!el) return;
 
@@ -304,6 +321,92 @@ async function loadOrganizations() {
     }
 }
 
+async function loadOrganizationsDashboard() {
+    try {
+        const [dashRes, orgsRes] = await Promise.all([
+            API.get('dashboard'),
+            API.get('organizations')
+        ]);
+
+        let orgs = orgsRes.success ? orgsRes.data : [];
+        if (currentUser?.role === 'operador_om' && currentUser.organization_id) {
+            orgs = orgs.filter(o => o.id === currentUser.organization_id);
+        }
+
+        const dash = dashRes.success ? dashRes.data : {};
+        const totalStations = dash.total_stations || 0;
+        const onlineStations = dash.online_stations || 0;
+        const bundlesMonth = dash.bundles_this_month || 0;
+
+        document.getElementById('orgs-dash-total').textContent = orgs.length;
+        document.getElementById('orgs-dash-stations').textContent = totalStations;
+        document.getElementById('orgs-dash-online').textContent = onlineStations;
+        document.getElementById('orgs-dash-bundles').textContent = bundlesMonth;
+
+        const searchWrapper = document.getElementById('orgs-search-wrapper');
+        if (orgs.length > 3) {
+            searchWrapper.classList.remove('hidden');
+        } else {
+            searchWrapper.classList.add('hidden');
+        }
+
+        const grid = document.getElementById('orgs-cards-grid');
+        grid.innerHTML = orgs.map(org => {
+            const logoHtml = org.logo_url
+                ? `<img src="${Utils.escapeHtml(org.logo_url)}" alt="${Utils.escapeHtml(org.acronym)}" class="org-logo-img">`
+                : `<div class="org-logo-placeholder">${Utils.escapeHtml(org.acronym?.substring(0, 3) || 'OM')}</div>`;
+
+            const scriptCount = org.script_count || 0;
+            const stationCount = org.station_count || 0;
+            const bundlesCount = org.bundles_count || 0;
+            const onlineCount = org.online_count || 0;
+            const compliance = stationCount > 0 ? Math.round((onlineCount / stationCount) * 100) : 0;
+            const barColor = compliance >= 100 ? 'var(--secondary)' : compliance > 0 ? 'var(--warning)' : 'var(--danger)';
+
+            return `
+                <div class="card cursor-pointer" onclick="selectOrganization(${org.id})" style="cursor:pointer; transition: transform 0.15s, border-color 0.15s;" onmouseover="this.style.transform='translateY(-2px)'; this.style.borderColor='var(--primary)';" onmouseout="this.style.transform=''; this.style.borderColor='';">
+                    <div class="card-body">
+                        <div class="flex items-center gap-3 mb-3">
+                            <div class="org-logo">${logoHtml}</div>
+                            <div class="flex-1 min-w-0">
+                                <div class="font-semibold text-sm truncate">${Utils.escapeHtml(org.name)}</div>
+                                <div class="flex items-center gap-2 mt-1">
+                                    <span class="badge badge-info">${Utils.escapeHtml(org.acronym)}</span>
+                                    <span class="text-xs text-muted truncate">${Utils.escapeHtml(org.domain || '')}</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="grid gap-2 text-xs" style="grid-template-columns: 1fr 1fr; margin-top: 0.75rem;">
+                            <div class="flex items-center gap-2"><span>📜</span> <span>${scriptCount} scripts</span></div>
+                            <div class="flex items-center gap-2"><span>🖥️</span> <span>${stationCount} estacoes</span></div>
+                            <div class="flex items-center gap-2"><span>📦</span> <span>${bundlesCount} bundles/mes</span></div>
+                            <div class="flex items-center gap-2"><span>📶</span> <span>${onlineCount}/${stationCount} online</span></div>
+                        </div>
+                        <div style="margin-top: 0.75rem;">
+                            <div style="height: 6px; background: var(--bg-darker); border-radius: 3px; overflow: hidden;">
+                                <div style="height: 100%; width: ${compliance}%; background: ${barColor}; transition: width 0.3s;"></div>
+                            </div>
+                            <div class="text-xs text-dim" style="margin-top: 0.25rem;">${compliance}% conformidade</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }).join('');
+
+        const searchInput = document.getElementById('orgs-search');
+        searchInput.oninput = function(e) {
+            const term = e.target.value.toLowerCase();
+            grid.querySelectorAll('.card').forEach(card => {
+                const text = card.textContent.toLowerCase();
+                card.style.display = text.includes(term) ? '' : 'none';
+            });
+        };
+    } catch (e) {
+        console.error('loadOrganizationsDashboard error:', e);
+        Toast.error('Erro ao carregar organizacoes');
+    }
+}
+
 async function selectOrganization(orgId) {
     currentOrgId = orgId;
     const org = organizations.find(o => o.id === orgId);
@@ -315,7 +418,7 @@ async function selectOrganization(orgId) {
     });
 
     // Hide all main views, show OM detail
-    ['view-dashboard', 'view-scripts-core', 'view-users', 'view-stations', 'view-audit'].forEach(id => {
+    ['view-dashboard', 'view-organizations', 'view-scripts-core', 'view-users', 'view-stations', 'view-audit'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.classList.add('hidden');
     });
@@ -335,6 +438,22 @@ async function selectOrganization(orgId) {
     document.getElementById('edit-org-acronym').value = org.acronym;
     document.getElementById('edit-org-domain').value = org.domain || '';
     document.getElementById('edit-org-description').value = org.description || '';
+
+    // Prefill DC/DNS fields from variables
+    try {
+        const varRes = await API.get('variables', { id: orgId });
+        if (varRes.success) {
+            const vars = varRes.data.variables || [];
+            const findVar = (name) => vars.find(v => v.name === name)?.current_value || '';
+            document.getElementById('edit-org-dc-ip').value = findVar('DC_IP');
+            document.getElementById('edit-org-dns-primario').value = findVar('DNS_PRIMARIO');
+            document.getElementById('edit-org-dns-secundario').value = findVar('DNS_SECUNDARIO');
+        }
+    } catch (e) {
+        document.getElementById('edit-org-dc-ip').value = '';
+        document.getElementById('edit-org-dns-primario').value = '';
+        document.getElementById('edit-org-dns-secundario').value = '';
+    }
 
     // Badge
     const badge = document.getElementById('om-badge');
@@ -958,15 +1077,38 @@ async function updateOrganization(e) {
         domain: document.getElementById('edit-org-domain').value,
         description: document.getElementById('edit-org-description').value
     });
-    if (res.success) {
-        Toast.success('Organizacao atualizada');
-        closeModal('modal-edit-org');
-        loadDashboard();
-        await loadOrganizations();
-        selectOrganization(currentOrgId);
-    } else {
+    if (!res.success) {
         Toast.error(res.error || 'Erro ao atualizar');
+        return;
     }
+
+    // Save DC/DNS variables
+    const dcIp = document.getElementById('edit-org-dc-ip').value;
+    const dnsPrimario = document.getElementById('edit-org-dns-primario').value;
+    const dnsSecundario = document.getElementById('edit-org-dns-secundario').value;
+
+    try {
+        const varRes = await API.get('variables', { id: currentOrgId });
+        if (varRes.success) {
+            const vars = varRes.data.variables || [];
+            const updates = {};
+            vars.forEach(v => { updates[v.id] = v.current_value; });
+            const dcVar = vars.find(v => v.name === 'DC_IP');
+            const dnsPrimVar = vars.find(v => v.name === 'DNS_PRIMARIO');
+            const dnsSecVar = vars.find(v => v.name === 'DNS_SECUNDARIO');
+            if (dcVar) updates[dcVar.id] = dcIp;
+            if (dnsPrimVar) updates[dnsPrimVar.id] = dnsPrimario;
+            if (dnsSecVar) updates[dnsSecVar.id] = dnsSecundario;
+            await API.post('variables-update', { organization_id: currentOrgId, variables: updates });
+        }
+    } catch (e) {
+ console.warn('Failed to save DC/DNS variables:', e); }
+
+    Toast.success('Organizacao atualizada');
+    closeModal('modal-edit-org');
+    loadDashboard();
+    await loadOrganizations();
+    selectOrganization(currentOrgId);
 }
 window.updateOrganization = updateOrganization;
 

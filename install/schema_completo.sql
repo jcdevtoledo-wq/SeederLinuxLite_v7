@@ -199,8 +199,7 @@ INSERT INTO variable_catalog (variable_name, description, category, example_valu
 ('CERTIFICATE_AUTO_INSTALL', 'Instalar certificados automaticamente (true/false)', 'outros', 'true', false, 53),
 ('INVENTORY_ENABLED', 'Habilitar coleta de inventario OCS (true/false)', 'outros', 'true', false, 54),
 ('GLPI_SERVER', 'Servidor GLPI para integracao de inventario', 'outros', 'https://glpi.intraer', false, 55),
-('ADMIN_USERNAME', 'Usuario administrador do dominio para ingresso no AD', 'dominio', 'admin', false, 56),
-('AUTH_METHOD', 'Metodo de autenticacao: sssd (recomendado para cache offline) ou winbind (legado)', 'dominio', 'sssd', false, 57)
+('ADMIN_USERNAME', 'Usuario administrador do dominio para ingresso no AD', 'dominio', 'admin', false, 56)
 ON CONFLICT (variable_name) DO UPDATE SET
     description = EXCLUDED.description,
     category = EXCLUDED.category,
