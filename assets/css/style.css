@@ -775,30 +775,7 @@ td {
 .sticky { position: sticky; }
 .top-0 { top: 0; }
 .col-span-2 { grid-column: span 2; }
-.first-mt-0:first-child { margin-top: 0; }
-
-.org-logo {
-    width: 48px;
-    height: 48px;
-    border-radius: 8px;
-    overflow: hidden;
-    flex-shrink: 0;
-    background: var(--bg-darker);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-.org-logo-img {
-    width: 48px;
-    height: 48px;
-    object-fit: cover;
-}
-.org-logo-placeholder {
-    font-size: 0.75rem;
-    font-weight: 700;
-    color: var(--text-dim);
-    text-transform: uppercase;
-}
+.first:mt-0:first-child { margin-top: 0; }
 .uppercase { text-transform: uppercase; }
 
 /* Gradient Badge */

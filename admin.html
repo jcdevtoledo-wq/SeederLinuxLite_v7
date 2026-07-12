@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin - SeederLinux Lite</title>
-    <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="assets/css/style.css">
 </head>
@@ -256,39 +255,6 @@
                     </div>
                 </div>
 
-                <!-- Organizations Dashboard View -->
-                <div id="view-organizations" class="hidden">
-                    <div class="stats-grid" id="orgs-dashboard-stats">
-                        <div class="stat-card">
-                            <div class="stat-icon blue">🏢</div>
-                            <div class="stat-value" id="orgs-dash-total">0</div>
-                            <div class="stat-label">Organizacoes</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon green">🖥️</div>
-                            <div class="stat-value" id="orgs-dash-stations">0</div>
-                            <div class="stat-label">Estacoes Totais</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon cyan">📶</div>
-                            <div class="stat-value" id="orgs-dash-online">0</div>
-                            <div class="stat-label">Estacoes Online</div>
-                        </div>
-                        <div class="stat-card">
-                            <div class="stat-icon amber">📦</div>
-                            <div class="stat-value" id="orgs-dash-bundles">0</div>
-                            <div class="stat-label">Bundles/Mes</div>
-                        </div>
-                    </div>
-
-                    <div id="orgs-search-wrapper" class="hidden mb-4">
-                        <input type="text" id="orgs-search" placeholder="Buscar organizacao..." class="form-input" style="max-width: 400px;">
-                    </div>
-
-                    <div class="grid gap-4" id="orgs-cards-grid" style="grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));">
-                    </div>
-                </div>
-
                 <!-- Users View -->
                 <div id="view-users" class="hidden">
                     <div class="card">
@@ -451,23 +417,6 @@
                     <div class="form-group">
                         <label class="form-label">Descricao</label>
                         <textarea id="edit-org-description" class="form-input form-textarea" rows="2"></textarea>
-                    </div>
-                    <div class="border border-slate-700 rounded-lg p-4 mt-4">
-                        <h4 class="font-semibold mb-3">Configuracao de Rede</h4>
-                        <div class="grid gap-4" style="grid-template-columns: 1fr 1fr 1fr;">
-                            <div class="form-group">
-                                <label class="form-label">DC Principal (IP) *</label>
-                                <input type="text" id="edit-org-dc-ip" class="form-input font-mono" placeholder="10.0.0.1">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">DNS Primario *</label>
-                                <input type="text" id="edit-org-dns-primario" class="form-input font-mono" placeholder="10.0.0.1">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">DNS Secundario</label>
-                                <input type="text" id="edit-org-dns-secundario" class="form-input font-mono" placeholder="10.0.0.2">
-                            </div>
-                        </div>
                     </div>
                 </div>
                 <div class="modal-footer">
