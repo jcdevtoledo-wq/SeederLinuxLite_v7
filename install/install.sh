@@ -147,19 +147,24 @@ setup_postgresql() {
 apply_database_schema() {
     print_header "APLICANDO SCHEMA DO BANCO DE DADOS"
 
-    # Prioriza schema_completo.sql (consolidado), fallback para schema.sql
-    if [ -f "${SCRIPT_DIR}/schema_completo.sql" ]; then
-        SCHEMA_FILE="${SCRIPT_DIR}/schema_completo.sql"
-    elif [ -f "${SCRIPT_DIR}/schema.sql" ]; then
-        SCHEMA_FILE="${SCRIPT_DIR}/schema.sql"
-    else
-        print_error "Nenhum arquivo de schema encontrado em ${SCRIPT_DIR}"
+    SCHEMA_FILE="${SCRIPT_DIR}/schema.sql"
+    if [ ! -f "$SCHEMA_FILE" ]; then
+        print_error "schema.sql nao encontrado em ${SCRIPT_DIR}"
         exit 1
     fi
 
     print_step "Aplicando schema: $(basename "$SCHEMA_FILE")"
     PGPASSWORD="${DB_PASS}" psql -h localhost -U "${DB_USER}" -d "${DB_NAME}" -f "$SCHEMA_FILE" 2>&1 | grep -v "already exists" || true
-    
+
+    # Carregar scripts Core de provisionamento
+    if [ -f "${SCRIPT_DIR}/insert_core_scripts.sql" ]; then
+        print_step "Carregando scripts Core de provisionamento..."
+        PGPASSWORD="${DB_PASS}" psql -h localhost -U "${DB_USER}" -d "${DB_NAME}" -f "${SCRIPT_DIR}/insert_core_scripts.sql" 2>&1 | grep -v "already exists" || true
+        print_success "Scripts Core carregados com sucesso"
+    else
+        print_warning "Arquivo insert_core_scripts.sql nao encontrado — scripts Core nao foram carregados"
+    fi
+
     print_success "Schema aplicado com sucesso"
 }
 
@@ -311,7 +316,7 @@ show_summary() {
 
     echo -e "\n${BOLD}Arquivos:${NC}"
     echo -e "  Diretório: ${INSTALL_DIR}"
-    echo -e "  Schema:    ${INSTALL_DIR}/install/schema_completo.sql"
+    echo -e "  Schema:    ${INSTALL_DIR}/install/schema.sql"
     echo -e "  Config:    ${INSTALL_DIR}/.env"
 
     echo -e "\n${BOLD}Logs:${NC}"
