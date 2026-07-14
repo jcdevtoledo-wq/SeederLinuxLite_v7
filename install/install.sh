@@ -112,6 +112,7 @@ install_system_packages() {
         php-curl \
         php-zip \
         php-gd \
+        sudo \
         libapache2-mod-php
 
     PHP_VER=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || echo "desconhecida")
