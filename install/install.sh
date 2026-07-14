@@ -46,26 +46,50 @@ check_root() {
 }
 
 configure_sources() {
-    print_header "CONFIGURANDO REPOSITÓRIOS (Debian 13)"
+    print_header "CONFIGURANDO REPOSITÓRIOS"
+
+    # Detectar versão do Debian
+    if [ -f /etc/debian_version ]; then
+        DEBIAN_VERSION=$(cat /etc/debian_version | cut -d. -f1)
+        case "$DEBIAN_VERSION" in
+            13) CODENAME="trixie" ;;
+            12) CODENAME="bookworm" ;;
+            11) CODENAME="bullseye" ;;
+            *)  CODENAME="trixie" ;; # fallback
+        esac
+    else
+        CODENAME="trixie"
+    fi
+    print_step "Debian detectado: ${CODENAME}"
+
+    # Remover arquivos conflitantes do sources.list.d
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+        print_step "Removendo debian.sources conflitante..."
+        rm -f /etc/apt/sources.list.d/debian.sources
+    fi
     
-    cat > /etc/apt/sources.list << 'EOF'
-# Debian 13 (Trixie) - Repositórios Oficiais
+    # Desabilitar outros arquivos .list que possam conflitar
+    for f in /etc/apt/sources.list.d/*.list; do
+        if [ -f "$f" ]; then
+            mv "$f" "${f}.bak" 2>/dev/null || true
+        fi
+    done
 
-# Repositório principal
-deb http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
-deb-src http://deb.debian.org/debian/ trixie main contrib non-free non-free-firmware
+    # Escrever sources.list correto
+    cat > /etc/apt/sources.list << EOF
+# Debian ${DEBIAN_VERSION} (${CODENAME}) - Repositórios Oficiais
+deb http://deb.debian.org/debian ${CODENAME} main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian ${CODENAME} main contrib non-free non-free-firmware
 
-# Atualizações de segurança
-deb http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
-deb-src http://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian-security ${CODENAME}-security main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian-security ${CODENAME}-security main contrib non-free non-free-firmware
 
-# Atualizações estáveis
-deb http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
-deb-src http://deb.debian.org/debian/ trixie-updates main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian ${CODENAME}-updates main contrib non-free non-free-firmware
+deb-src http://deb.debian.org/debian ${CODENAME}-updates main contrib non-free non-free-firmware
 EOF
 
     apt-get update -qq
-    print_success "Repositórios configurados"
+    print_success "Repositórios configurados para Debian ${CODENAME}"
 }
 
 install_system_packages() {
