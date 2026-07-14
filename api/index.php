@@ -1,1214 +1,710 @@
 <?php
-require_once __DIR__ . '/../lib/config.php';
-require_once __DIR__ . '/../lib/db.php';
-require_once __DIR__ . '/../lib/functions.php';
-
-header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization');
-
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') exit(0);
-
-$action = $_GET['action'] ?? '';
-$id = isset($_GET['id']) ? (int)$_GET['id'] : null;
-$orgId = isset($_GET['org_id']) ? (int)$_GET['org_id'] : null;
-$method = $_SERVER['REQUEST_METHOD'];
-
-// Parse input
-$input = [];
-if ($method === 'POST' || $method === 'PUT') {
-    $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
-    if (strpos($contentType, 'multipart/form-data') !== false) {
-        $input = $_POST;
-    } else {
-        $raw = file_get_contents('php://input');
-        $input = json_decode($raw, true) ?? [];
-    }
-}
-
-try {
-    switch ($action) {
-        // Auth
-        case 'login':
-            if ($method !== 'POST') jsonError('Method not allowed', 405);
-            handleLogin($input);
-            break;
-        case 'logout':
-            handleLogout();
-            break;
-        case 'session':
-            handleSessionCheck();
-            break;
-
-        // Dashboard (global or per-org)
-        case 'dashboard':
-            requireAuth();
-            handleDashboard($orgId);
-            break;
-
-        // Organizations
-        case 'organizations':
-            requireAuth();
-            if ($method === 'GET') handleGetOrganizations();
-            elseif ($method === 'POST') handleCreateOrganization($input);
-            else jsonError('Method not allowed', 405);
-            break;
-        case 'organization':
-            requireAuth();
-            if (!$id) jsonError('ID required', 400);
-            if ($method === 'GET') handleGetOrganization($id);
-            elseif ($method === 'PUT') handleUpdateOrganization($id, $input);
-            elseif ($method === 'DELETE') handleDeleteOrganization($id);
-            else jsonError('Method not allowed', 405);
-            break;
-
-        // Variables
-        case 'variables':
-            requireAuth();
-            handleGetVariables($id);
-            break;
-        case 'variables-update':
-            requireAuth();
-            if ($method !== 'POST') jsonError('Method not allowed', 405);
-            handleUpdateVariables($input);
-            break;
-        case 'variable-add':
-            requireAuth();
-            if ($method !== 'POST') jsonError('Method not allowed', 405);
-            handleAddVariable($input);
-            break;
-
-        // Scripts
-        case 'scripts':
-            requireAuth();
-            handleGetScripts($orgId);
-            break;
-        case 'script':
-            requireAuth();
-            if ($method === 'GET' && $id) handleGetScript($id);
-            elseif ($method === 'PUT' && $id) handleUpdateScript($id, $input);
-            elseif ($method === 'DELETE' && $id) handleDeleteScript($id);
-            elseif ($method === 'POST') handleCreateScript($input);
-            else jsonError('Method not allowed', 405);
-            break;
-        case 'script-upload':
-            requireAuth();
-            if ($method !== 'POST') jsonError('Method not allowed', 405);
-            handleUploadScript();
-            break;
-
-        // Bundle
-        case 'generate-bundle':
-            requireAuth();
-            if ($method !== 'POST') jsonError('Method not allowed', 405);
-            handleGenerateBundle($input);
-            break;
-        case 'bundle-by-id':
-            requireAuth();
-            handleDownloadBundle($id);
-            break;
-
-        // Users
-        case 'users':
-            requireAuth();
-            if ($method === 'GET') handleGetUsers();
-            elseif ($method === 'POST') handleCreateUser($input);
-            else jsonError('Method not allowed', 405);
-            break;
-        case 'user':
-            requireAuth();
-            if (!$id) jsonError('ID required', 400);
-            if ($method === 'PUT') handleUpdateUser($id, $input);
-            elseif ($method === 'DELETE') handleDeleteUser($id);
-            elseif ($method === 'POST') handleToggleUserStatus($id);
-            else jsonError('Method not allowed', 405);
-            break;
-
-        // Stations
-        case 'stations':
-            requireAuth();
-            handleGetStations($orgId);
-            break;
-        case 'checkin':
-            if ($method !== 'POST') jsonError('Method not allowed', 405);
-            handleStationCheckin($input);
-            break;
-
-        // Audit
-        case 'audit':
-            requireAuth();
-            handleGetAuditEvents();
-            break;
-
-        // Uploads
-        case 'upload-wallpaper':
-            requireAuth();
-            if ($method !== 'POST') jsonError('Method not allowed', 405);
-            handleUploadWallpaper();
-            break;
-        case 'upload-logo':
-            requireAuth();
-            if ($method !== 'POST') jsonError('Method not allowed', 405);
-            handleUploadLogo();
-            break;
-        case 'wallpapers':
-            requireAuth();
-            handleGetWallpapers($orgId);
-            break;
-        case 'logos':
-            requireAuth();
-            handleGetLogos($orgId);
-            break;
-
-        default:
-            jsonError('Endpoint invalido: ' . $action, 404);
-    }
-} catch (RuntimeException $e) {
-    jsonError($e->getMessage());
-} catch (Exception $e) {
-    error_log('API Error: ' . $e->getMessage());
-    jsonError('Erro interno do servidor', 500);
-}
-
-// ============ HANDLERS ============
-
-function handleLogin($input) {
-    $username = sanitizeInput($input['username'] ?? '');
-    $password = $input['password'] ?? '';
-
-    if (empty($username) || empty($password)) {
-        jsonError('Username e senha obrigatorios');
-    }
-
-    $user = Database::fetchOne(
-        "SELECT id, username, password_hash, full_name, email, role, organization_id, is_active FROM users WHERE username = ?",
-        [$username]
-    );
-
-    if (!$user || !$user['is_active'] || !password_verify($password, $user['password_hash'])) {
-        jsonError('Credenciais invalidas', 401);
-    }
-
-    $_SESSION['user_id'] = $user['id'];
-    $_SESSION['username'] = $user['username'];
-    $_SESSION['role'] = $user['role'];
-    $_SESSION['organization_id'] = $user['organization_id'];
-
-    $token = bin2hex(random_bytes(32));
-    $tokenHash = password_hash($token, PASSWORD_DEFAULT);
-    Database::execute(
-        "INSERT INTO user_tokens (user_id, token_hash, expires_at) VALUES (?, ?, NOW() + INTERVAL '24 hours')",
-        [$user['id'], $tokenHash]
-    );
-
-    $org = $user['organization_id'] ? Database::fetchOne("SELECT id, acronym, name, domain FROM organizations WHERE id = ?", [$user['organization_id']]) : null;
-
-    log_audit('LOGIN', 'users', $user['id'], ['username' => $username]);
-
-    jsonSuccess([
-        'id' => $user['id'],
-        'username' => $user['username'],
-        'full_name' => $user['full_name'],
-        'email' => $user['email'],
-        'role' => $user['role'],
-        'token' => $token,
-        'organization_id' => $user['organization_id'],
-        'org_acronym' => $org['acronym'] ?? null,
-        'org_name' => $org['name'] ?? null
-    ], 'Login realizado com sucesso');
-}
-
-function handleLogout() {
-    log_audit('LOGOUT', 'users', $_SESSION['user_id'] ?? null);
-    session_destroy();
-    jsonSuccess(null, 'Logout realizado');
-}
-
-function handleSessionCheck() {
-    if (isset($_SESSION['user_id'])) {
-        $org = $_SESSION['organization_id'] ? Database::fetchOne("SELECT id, acronym, name, domain FROM organizations WHERE id = ?", [$_SESSION['organization_id']]) : null;
-        jsonSuccess([
-            'id' => $_SESSION['user_id'],
-            'username' => $_SESSION['username'],
-            'role' => $_SESSION['role'],
-            'organization_id' => $_SESSION['organization_id'],
-            'org_acronym' => $org['acronym'] ?? null,
-            'org_name' => $org['name'] ?? null
-        ], 'Sessao ativa');
-    }
-    jsonResponse(['success' => false, 'error' => 'Not authenticated'], 200);
-}
-
-function handleDashboard(?int $filterOrgId = null) {
-    $userOrgId = getUserOrgId();
-    $isAdmin = isAdminGap();
-
-    // Determine effective org scope
-    $scopeOrgId = null;
-    if ($filterOrgId) {
-        // Per-OM dashboard: admins can view any, operators only their own
-        if ($userOrgId !== null && !$isAdmin && $userOrgId !== $filterOrgId) {
-            jsonError('Sem permissao', 403);
-        }
-        $scopeOrgId = $filterOrgId;
-    } elseif ($userOrgId !== null && !$isAdmin) {
-        $scopeOrgId = $userOrgId;
-    }
-
-    $twoHoursAgo = date('Y-m-d H:i:s', strtotime('-2 hours'));
-
-    $stats = [
-        'organizations' => 0,
-        'scripts' => 0,
-        'variables' => 0,
-        'bundles_this_month' => 0,
-        'stations_online' => 0,
-        'stations_outdated' => 0,
-        'recent_stations' => [],
-        'recent_orgs' => [],
-        'org_id' => $scopeOrgId,
-    ];
-
-    if ($scopeOrgId) {
-        // Scoped stats for a single org
-        $stats['organizations'] = 1;
-        $stats['scripts'] = (int)Database::fetchOne(
-            "SELECT COUNT(*) as c FROM scripts WHERE is_active = true AND (is_core = true OR organization_id = ?)",
-            [$scopeOrgId]
-        )['c'];
-        $stats['variables'] = (int)Database::fetchOne(
-            "SELECT COUNT(*) as c FROM organization_variables WHERE organization_id = ?",
-            [$scopeOrgId]
-        )['c'];
-        $stats['bundles_this_month'] = (int)Database::fetchOne(
-            "SELECT COUNT(*) as c FROM deploy_bundles WHERE organization_id = ? AND generated_at >= date_trunc('month', CURRENT_DATE)",
-            [$scopeOrgId]
-        )['c'];
-        $stats['stations_online'] = (int)Database::fetchOne(
-            "SELECT COUNT(*) as c FROM stations WHERE organization_id = ? AND last_checkin >= ?",
-            [$scopeOrgId, $twoHoursAgo]
-        )['c'];
-        $stats['stations_outdated'] = (int)Database::fetchOne(
-            "SELECT COUNT(*) as c FROM stations s
-             JOIN organizations o ON o.id = s.organization_id
-             WHERE s.organization_id = ? AND s.configuration_serial < o.serial_config",
-            [$scopeOrgId]
-        )['c'];
-        $stats['recent_stations'] = Database::fetchAll(
-            "SELECT s.hostname, s.ip_address, s.last_checkin, o.acronym as org_acronym,
-                    CASE WHEN s.configuration_serial >= o.serial_config THEN 'Atualizado' ELSE 'Desatualizado' END as status
-             FROM stations s
-             JOIN organizations o ON o.id = s.organization_id
-             WHERE s.organization_id = ?
-             ORDER BY s.last_checkin DESC NULLS LAST LIMIT 10",
-            [$scopeOrgId]
-        );
-        // Scripts for the org (core + custom)
-        $stats['org_scripts'] = Database::fetchAll(
-            "SELECT id, name, filename, is_core, version FROM scripts
-             WHERE is_active = TRUE AND (is_core = TRUE OR organization_id = ?)
-             ORDER BY is_core DESC, name",
-            [$scopeOrgId]
-        );
-    } else {
-        // Global stats
-        $stats['organizations'] = (int)Database::fetchOne("SELECT COUNT(*) as c FROM organizations WHERE is_active = true")['c'];
-        $stats['scripts'] = (int)Database::fetchOne("SELECT COUNT(*) as c FROM scripts WHERE is_active = true")['c'];
-        $stats['variables'] = (int)Database::fetchOne("SELECT COUNT(*) as c FROM variable_definitions")['c'];
-        $stats['bundles_this_month'] = (int)Database::fetchOne(
-            "SELECT COUNT(*) as c FROM deploy_bundles WHERE generated_at >= date_trunc('month', CURRENT_DATE)"
-        )['c'];
-        $stats['stations_online'] = (int)Database::fetchOne(
-            "SELECT COUNT(*) as c FROM stations WHERE last_checkin >= ?", [$twoHoursAgo]
-        )['c'];
-        $stats['stations_outdated'] = (int)Database::fetchOne(
-            "SELECT COUNT(*) as c FROM stations s
-             JOIN organizations o ON o.id = s.organization_id
-             WHERE s.configuration_serial < o.serial_config"
-        )['c'];
-        $stats['recent_stations'] = Database::fetchAll(
-            "SELECT s.hostname, s.ip_address, s.last_checkin, o.acronym as org_acronym,
-                    CASE WHEN s.configuration_serial >= o.serial_config THEN 'Atualizado' ELSE 'Desatualizado' END as status
-             FROM stations s
-             JOIN organizations o ON o.id = s.organization_id
-             ORDER BY s.last_checkin DESC NULLS LAST LIMIT 10"
-        );
-        $stats['recent_orgs'] = Database::fetchAll(
-            "SELECT id, name, acronym, domain FROM organizations WHERE is_active = true ORDER BY created_at DESC LIMIT 5"
-        );
-    }
-
-    jsonSuccess($stats);
-}
-
-function handleGetOrganizations() {
-    $userOrgId = getUserOrgId();
-    $isAdmin = isAdminGap();
-
-    if ($userOrgId !== null && !$isAdmin) {
-        $orgs = Database::fetchAll(
-            "SELECT id, name, acronym, domain, description, is_active, created_at FROM organizations WHERE is_active = TRUE AND id = ? ORDER BY acronym",
-            [$userOrgId]
-        );
-    } else {
-        $orgs = Database::fetchAll(
-            "SELECT id, name, acronym, domain, description, is_active, created_at FROM organizations WHERE is_active = TRUE ORDER BY acronym"
-        );
-    }
-
-    foreach ($orgs as &$org) {
-        $logo = Database::fetchOne(
-            "SELECT ov.value FROM organization_variables ov
-             JOIN variable_definitions vd ON vd.id = ov.variable_id
-             WHERE ov.organization_id = ? AND vd.name = 'LOGO_URL'",
-            [$org['id']]
-        );
-        $org['logo_url'] = $logo['value'] ?? null;
-    }
-
-    jsonSuccess($orgs);
-}
-
-function handleGetOrganization($id) {
-    $org = Database::fetchOne("SELECT id, name, acronym, domain, description, is_active, created_at FROM organizations WHERE id = ?", [$id]);
-    if (!$org) jsonError('Organizacao nao encontrada', 404);
-
-    $logo = Database::fetchOne(
-        "SELECT ov.value FROM organization_variables ov
-         JOIN variable_definitions vd ON vd.id = ov.variable_id
-         WHERE ov.organization_id = ? AND vd.name = 'LOGO_URL'",
-        [$id]
-    );
-    $org['logo_url'] = $logo['value'] ?? null;
-
-    jsonSuccess($org);
-}
-
-function handleCreateOrganization($input) {
-    if (!isAdminGap()) jsonError('Sem permissao', 403);
-
-    $name = sanitizeInput($input['name'] ?? '');
-    $acronym = strtoupper(sanitizeInput($input['acronym'] ?? ''));
-    $domain = sanitizeInput($input['domain'] ?? '');
-    $description = sanitizeInput($input['description'] ?? '');
-    $dcIp = sanitizeInput($input['dc_ip'] ?? '');
-    $dnsPrimario = sanitizeInput($input['dns_primario'] ?? '');
-    $dnsSecundario = sanitizeInput($input['dns_secundario'] ?? '');
-    $proxyHttp = sanitizeInput($input['proxy_http'] ?? '');
-    $proxyPorta = sanitizeInput($input['proxy_porta'] ?? '');
-
-    if (empty($name) || empty($acronym)) jsonError('Nome e sigla obrigatorios');
-    if ($domain && (empty($dcIp) || empty($dnsPrimario))) {
-        jsonError('DC_IP e DNS Primario obrigatorios quando dominio informado');
-    }
-
-    if (Database::fetchOne("SELECT id FROM organizations WHERE acronym = ?", [$acronym])) {
-        jsonError('Sigla ja cadastrada');
-    }
-
-    Database::beginTransaction();
-
-    try {
-        Database::execute(
-            "INSERT INTO organizations (name, acronym, domain, description) VALUES (?, ?, ?, ?)",
-            [$name, $acronym, $domain, $description]
-        );
-
-        $newOrgId = (int)Database::lastInsertId();
-
-        Database::execute(
-            "INSERT INTO organization_variables (organization_id, variable_id, value)
-             SELECT ?, id, COALESCE(default_value, '') FROM variable_definitions",
-            [$newOrgId]
-        );
-
-        generateDefaultVariables($newOrgId, $name, $acronym, $domain, $dcIp, $dnsPrimario, $dnsSecundario, $proxyHttp, $proxyPorta);
-
-        Database::commit();
-    } catch (Exception $e) {
-        Database::rollback();
-        error_log('handleCreateOrganization error: ' . $e->getMessage());
-        jsonError('Erro ao criar organizacao: ' . $e->getMessage(), 500);
-    }
-
-    log_audit('CREATE', 'organizations', $newOrgId, ['name' => $name, 'acronym' => $acronym]);
-    log_event("Organizacao criada: $acronym (id=$newOrgId)", 'INFO');
-
-    jsonSuccess(
-        Database::fetchOne("SELECT id, name, acronym, domain, description FROM organizations WHERE id = ?", [$newOrgId]),
-        'Organizacao criada com sucesso'
-    );
-}
-
-function handleUpdateOrganization($id, $input) {
-    if (!isAdminGap()) jsonError('Sem permissao', 403);
-
-    $name = sanitizeInput($input['name'] ?? '');
-    $domain = sanitizeInput($input['domain'] ?? '');
-    $description = sanitizeInput($input['description'] ?? '');
-
-    if (empty($name)) jsonError('Nome obrigatorio');
-
-    Database::execute(
-        "UPDATE organizations SET name = ?, domain = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        [$name, $domain, $description, $id]
-    );
-
-    bumpOrgSerial($id);
-
-    log_audit('UPDATE', 'organizations', $id, ['name' => $name]);
-    jsonSuccess(null, 'Organizacao atualizada');
-}
-
-function handleDeleteOrganization($id) {
-    if (!isAdminGap()) jsonError('Sem permissao', 403);
-
-    $org = Database::fetchOne("SELECT acronym FROM organizations WHERE id = ?", [$id]);
-    if (!$org) jsonError('Organizacao nao encontrada', 404);
-
-    Database::execute("UPDATE organizations SET is_active = FALSE WHERE id = ?", [$id]);
-
-    log_audit('DELETE', 'organizations', $id, ['acronym' => $org['acronym']]);
-    jsonSuccess(null, 'Organizacao excluida');
-}
-
-// VARIABLES
-function handleGetVariables($orgId) {
-    if (!$orgId) $orgId = getUserOrgId();
-    if (!$orgId) jsonError('Organization ID required', 400);
-
-    $vars = Database::fetchAll(
-        "SELECT vd.id, vd.name, vd.description, vd.category, vd.type, vd.is_required, vd.default_value,
-                ov.value as current_value
-         FROM variable_definitions vd
-         LEFT JOIN organization_variables ov ON ov.variable_id = vd.id AND ov.organization_id = ?
-         ORDER BY vd.category, vd.name",
-        [$orgId]
-    );
-
-    jsonSuccess(['variables' => $vars, 'organization_id' => $orgId]);
-}
-
-function handleUpdateVariables($input) {
-    $orgId = (int)($input['organization_id'] ?? 0);
-    $variables = $input['variables'] ?? [];
-
-    if (!$orgId) jsonError('Organization ID required');
-
-    foreach ($variables as $varId => $value) {
-        Database::execute(
-            "UPDATE organization_variables SET value = ?, updated_at = CURRENT_TIMESTAMP
-             WHERE organization_id = ? AND variable_id = ?",
-            [$value, $orgId, $varId]
-        );
-    }
-
-    log_audit('UPDATE', 'variables', null, ['organization_id' => $orgId, 'count' => count($variables)]);
-    bumpOrgSerial($orgId);
-    jsonSuccess(null, 'Variaveis salvas com sucesso');
-}
-
-function handleAddVariable($input) {
-    if (!isAdminGap()) jsonError('Sem permissao', 403);
-
-    $name = strtoupper(sanitizeInput($input['name'] ?? ''));
-    $type = sanitizeInput($input['type'] ?? 'text');
-    $value = sanitizeInput($input['value'] ?? '');
-    $description = sanitizeInput($input['description'] ?? '');
-    $category = sanitizeInput($input['category'] ?? 'generic');
-    $isRequired = isset($input['is_required']) && $input['is_required'] ? true : false;
-
-    if (empty($name)) jsonError('Nome da variavel obrigatorio');
-
-    if (Database::fetchOne("SELECT id FROM variable_definitions WHERE name = ?", [$name])) {
-        jsonError('Variavel ja existe');
-    }
-
-    Database::execute(
-        "INSERT INTO variable_definitions (name, description, type, category, is_required, default_value)
-         VALUES (?, ?, ?, ?, ?, ?)",
-        [$name, $description, $type, $category, $isRequired, $value]
-    );
-
-    $varId = (int)Database::lastInsertId();
-
-    $orgs = Database::fetchAll("SELECT id FROM organizations WHERE is_active = true");
-    foreach ($orgs as $org) {
-        Database::execute(
-            "INSERT INTO organization_variables (organization_id, variable_id, value) VALUES (?, ?, ?)",
-            [$org['id'], $varId, $value]
-        );
-    }
-
-    log_audit('CREATE', 'variable_definitions', $varId, ['name' => $name]);
-    jsonSuccess(['id' => $varId], 'Variavel criada');
-}
-
-// SCRIPTS
-function handleGetScripts($orgId) {
-    $userOrgId = getUserOrgId();
-    $isAdmin = isAdminGap();
-
-    if ($userOrgId !== null && !$isAdmin) {
-        $scripts = Database::fetchAll(
-            "SELECT id, name, filename, description, is_core, is_active, organization_id, version, created_at
-             FROM scripts
-             WHERE is_active = TRUE AND (is_core = TRUE OR organization_id = ?)
-             ORDER BY is_core DESC, name",
-            [$userOrgId]
-        );
-    } else {
-        $scripts = Database::fetchAll(
-            "SELECT id, name, filename, description, is_core, is_active, organization_id, version, created_at
-             FROM scripts
-             WHERE is_active = TRUE
-             ORDER BY is_core DESC, name"
-        );
-    }
-
-    jsonSuccess($scripts);
-}
-
-function handleGetScript($id) {
-    $script = Database::fetchOne(
-        "SELECT id, name, filename, description, content, is_core, is_active, organization_id, version, created_at, updated_at
-         FROM scripts WHERE id = ? AND is_active = TRUE",
-        [$id]
-    );
-
-    if (!$script) jsonError('Script nao encontrado', 404);
-
-    $userOrgId = getUserOrgId();
-    if (!$script['is_core'] && $userOrgId !== null && $script['organization_id'] != $userOrgId) {
-        jsonError('Sem permissao', 403);
-    }
-
-    jsonSuccess($script);
-}
-
-function handleCreateScript($input) {
-    $name = sanitizeInput($input['name'] ?? '');
-    $filename = sanitizeInput($input['filename'] ?? '');
-    $description = sanitizeInput($input['description'] ?? '');
-    $content = $input['content'] ?? '';
-    $isCore = isset($input['is_core']) && $input['is_core'] ? true : false;
-
-    if (empty($name) || empty($filename)) jsonError('Nome e arquivo obrigatorios');
-
-    $userOrgId = getUserOrgId();
-    if (!$isCore && $userOrgId === null && !isAdminGap()) {
-        jsonError('Sem permissao para criar scripts', 403);
-    }
-
-    if (Database::fetchOne("SELECT id FROM scripts WHERE filename = ?", [$filename])) {
-        jsonError('Arquivo ja existe');
-    }
-
-    Database::execute(
-        "INSERT INTO scripts (name, filename, description, content, is_core, organization_id, is_active)
-         VALUES (?, ?, ?, ?, ?, ?, TRUE)",
-        [$name, $filename, $description, $content, $isCore, $userOrgId ?: null]
-    );
-
-    $scriptId = (int)Database::lastInsertId();
-    log_audit('CREATE', 'scripts', $scriptId, ['name' => $name, 'filename' => $filename]);
-    jsonSuccess(['id' => $scriptId], 'Script criado');
-}
-
-function handleUpdateScript($id, $input) {
-    $script = Database::fetchOne("SELECT id, is_core, organization_id FROM scripts WHERE id = ?", [$id]);
-    if (!$script) jsonError('Script nao encontrado', 404);
-    if ($script['is_core']) jsonError('Scripts core nao podem ser alterados', 403);
-
-    $userOrgId = getUserOrgId();
-    if ($userOrgId !== null && $script['organization_id'] != $userOrgId) {
-        jsonError('Sem permissao', 403);
-    }
-
-    $name = sanitizeInput($input['name'] ?? '');
-    $description = sanitizeInput($input['description'] ?? '');
-    $content = $input['content'] ?? '';
-
-    if (empty($name)) jsonError('Nome obrigatorio');
-
-    Database::execute(
-        "UPDATE scripts SET name = ?, description = ?, content = ?, version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        [$name, $description, $content, $id]
-    );
-
-    log_audit('UPDATE', 'scripts', $id, ['name' => $name]);
-    jsonSuccess(null, 'Script atualizado');
-}
-
-function handleDeleteScript($id) {
-    $script = Database::fetchOne("SELECT id, is_core, organization_id, name FROM scripts WHERE id = ?", [$id]);
-    if (!$script) jsonError('Script nao encontrado', 404);
-    if ($script['is_core']) jsonError('Scripts core nao podem ser excluidos', 403);
-
-    $userOrgId = getUserOrgId();
-    if ($userOrgId !== null && $script['organization_id'] != $userOrgId) {
-        jsonError('Sem permissao', 403);
-    }
-
-    Database::execute("UPDATE scripts SET is_active = FALSE WHERE id = ?", [$id]);
-    log_audit('DELETE', 'scripts', $id, ['name' => $script['name']]);
-    jsonSuccess(null, 'Script excluido');
-}
-
-function handleUploadScript() {
-    $userOrgId = getUserOrgId();
-    if ($userOrgId === null && !isAdminGap()) jsonError('Sem permissao', 403);
-
-    if (!isset($_FILES['script']) || $_FILES['script']['error'] !== UPLOAD_ERR_OK) {
-        jsonError('Nenhum arquivo enviado', 400);
-    }
-
-    $file = $_FILES['script'];
-    $name = sanitizeInput($_POST['name'] ?? pathinfo($file['name'], PATHINFO_FILENAME));
-    $description = sanitizeInput($_POST['description'] ?? '');
-    $isCore = isset($_POST['is_core']) && $_POST['is_core'] ? true : false;
-
-    if ($file['size'] > 500 * 1024) jsonError('Arquivo muito grande (max 500KB)', 400);
-
-    $content = file_get_contents($file['tmp_name']);
-    $filename = sanitizeInput($file['name']);
-
-    if (Database::fetchOne("SELECT id FROM scripts WHERE filename = ?", [$filename])) {
-        jsonError('Arquivo ja existe');
-    }
-
-    Database::execute(
-        "INSERT INTO scripts (name, filename, description, content, is_core, organization_id, is_active)
-         VALUES (?, ?, ?, ?, ?, ?, TRUE)",
-        [$name, $filename, $description, $content, $isCore, $userOrgId]
-    );
-
-    $scriptId = (int)Database::lastInsertId();
-    log_audit('UPLOAD', 'scripts', $scriptId, ['name' => $name, 'filename' => $filename]);
-    log_event("Script criado: $filename (id=$scriptId)", 'INFO');
-    jsonSuccess(['id' => $scriptId, 'filename' => $filename], 'Script enviado');
-}
-
-// BUNDLE
-function handleGenerateBundle($input) {
-    $orgId = (int)($input['organization_id'] ?? 0);
-    $selectedScripts = $input['scripts'] ?? [];
-
-    if (!$orgId) jsonError('Organization ID required');
-
-    $userOrgId = getUserOrgId();
-    if ($userOrgId !== null && $userOrgId !== $orgId) jsonError('Sem permissao', 403);
-
-    $org = Database::fetchOne("SELECT id, acronym, domain, serial_config FROM organizations WHERE id = ?", [$orgId]);
-    if (!$org) jsonError('Organizacao nao encontrada', 404);
-
-    $vars = Database::fetchAll(
-        "SELECT vd.name, ov.value FROM organization_variables ov
-         JOIN variable_definitions vd ON vd.id = ov.variable_id
-         WHERE ov.organization_id = ?",
-        [$orgId]
-    );
-
-    if (empty($selectedScripts)) {
-        $scripts = Database::fetchAll(
-            "SELECT id, name, filename, content, is_core FROM scripts
-             WHERE is_active = TRUE AND (is_core = TRUE OR organization_id = ?)
-             ORDER BY is_core DESC, execution_order, name",
-            [$orgId]
-        );
-    } else {
-        $placeholders = implode(',', array_fill(0, count($selectedScripts), '?'));
-        $params = array_merge([$orgId], $selectedScripts);
-        $scripts = Database::fetchAll(
-            "SELECT id, name, filename, content, is_core FROM scripts
-             WHERE is_active = TRUE AND (is_core = TRUE OR id IN ($placeholders))
-             ORDER BY is_core DESC, execution_order, name",
-            $params
-        );
-    }
-
-    $bundle = "#!/bin/bash\n";
-    $bundle .= "# ============================================\n";
-    $bundle .= "# SeederLinux Lite Bundle\n";
-    $bundle .= "# ============================================\n";
-    $bundle .= "# Organizacao: {$org['acronym']}\n";
-    $bundle .= "# Gerado em: " . date('Y-m-d H:i:s') . "\n";
-    $bundle .= "# Serial: {$org['serial_config']}\n";
-    $bundle .= "# Scripts: " . count($scripts) . "\n";
-    $bundle .= "# ============================================\n\n";
-
-    $bundle .= "# === VARIAVEIS ===\n";
-    foreach ($vars as $v) {
-        $bundle .= "export {$v['name']}='" . str_replace("'", "'\\''", $v['value'] ?? '') . "'\n";
-    }
-    $bundle .= "\n";
-
-    $bundle .= "# === SCRIPTS ===\n\n";
-    $scriptIds = [];
-    foreach ($scripts as $s) {
-        $scriptContent = substituir_placeholders($s['content'], $orgId);
-        $bundle .= "# --- {$s['name']} ({$s['filename']}) ---\n";
-        $bundle .= $scriptContent . "\n\n";
-        $scriptIds[] = $s['id'];
-    }
-
-    $bundle .= "# === FIM DO BUNDLE ===\n";
-    $bundle .= "echo 'Bundle executado com sucesso!'\n";
-
-    $filename = "bundle_{$org['acronym']}_" . date('Ymd_His') . ".sh";
-    $userId = $_SESSION['user_id'] ?? null;
-
-    Database::execute(
-        "INSERT INTO deploy_bundles (organization_id, user_id, filename, content, script_ids, scripts_count, generated_at)
-         VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-        [$orgId, $userId, $filename, $bundle, json_encode($scriptIds), count($scripts)]
-    );
-
-    $bundleId = (int)Database::lastInsertId();
-
-    bumpOrgSerial($orgId);
-
-    log_audit('GENERATE', 'bundles', $bundleId, ['organization' => $org['acronym'], 'scripts' => count($scripts)]);
-    log_event("Bundle gerado: {$org['acronym']} (id=$bundleId, scripts=" . count($scripts) . ")", 'INFO');
-
-    jsonSuccess([
-        'bundle_id' => $bundleId,
-        'filename' => $filename,
-        'download_url' => "/api/?action=bundle-by-id&id={$bundleId}",
-        'scripts_count' => count($scripts)
-    ], 'Bundle gerado com sucesso');
-}
-
-function handleDownloadBundle($id) {
-    $bundle = Database::fetchOne("SELECT id, filename, content FROM deploy_bundles WHERE id = ?", [$id]);
-    if (!$bundle) jsonError('Bundle nao encontrado', 404);
-
-    header('Content-Type: application/octet-stream');
-    header('Content-Disposition: attachment; filename="' . $bundle['filename'] . '"');
-    header('Content-Length: ' . strlen($bundle['content']));
-    echo $bundle['content'];
-    exit;
-}
-
-// USERS
-function handleGetUsers() {
-    if (!isAdminGap() && !isAuditor()) jsonError('Sem permissao', 403);
-
-    $users = Database::fetchAll(
-        "SELECT u.id, u.username, u.full_name, u.email, u.role, u.is_active, u.organization_id, u.created_at,
-                o.acronym as org_acronym
-         FROM users u
-         LEFT JOIN organizations o ON o.id = u.organization_id
-         ORDER BY u.username"
-    );
-
-    jsonSuccess($users);
-}
-
-function handleCreateUser($input) {
-    if (!isAdminGap()) jsonError('Sem permissao', 403);
-
-    $username = sanitizeInput($input['username'] ?? '');
-    $password = $input['password'] ?? '';
-    $confirmPassword = $input['confirm_password'] ?? '';
-    $fullName = sanitizeInput($input['full_name'] ?? '');
-    $email = sanitizeInput($input['email'] ?? '');
-    $role = sanitizeInput($input['role'] ?? 'operador_om');
-    $organizationId = $input['organization_id'] ?? null;
-
-    if (empty($username) || empty($password)) jsonError('Username e senha obrigatorios');
-    if ($password !== $confirmPassword) jsonError('Senhas nao conferem');
-    if (strlen($password) < 6) jsonError('Senha deve ter no minimo 6 caracteres');
-
-    if (Database::fetchOne("SELECT id FROM users WHERE username = ?", [$username])) {
-        jsonError('Username ja existe');
-    }
-
-    $passwordHash = password_hash($password, PASSWORD_DEFAULT);
-
-    Database::execute(
-        "INSERT INTO users (username, password_hash, full_name, email, role, organization_id)
-         VALUES (?, ?, ?, ?, ?, ?)",
-        [$username, $passwordHash, $fullName, $email, $role, $organizationId ?: null]
-    );
-
-    $userId = (int)Database::lastInsertId();
-    log_audit('CREATE', 'users', $userId, ['username' => $username, 'role' => $role]);
-
-    jsonSuccess(['id' => $userId], 'Usuario criado');
-}
-
-function handleUpdateUser($id, $input) {
-    if (!isAdminGap()) jsonError('Sem permissao', 403);
-
-    $username = sanitizeInput($input['username'] ?? '');
-    $fullName = sanitizeInput($input['full_name'] ?? '');
-    $email = sanitizeInput($input['email'] ?? '');
-    $role = sanitizeInput($input['role'] ?? 'operador_om');
-    $organizationId = $input['organization_id'] ?? null;
-    $password = $input['password'] ?? '';
-    $confirmPassword = $input['confirm_password'] ?? '';
-
-    if (empty($username)) jsonError('Username obrigatorio');
-    if ($password && $password !== $confirmPassword) jsonError('Senhas nao conferem');
-
-    if ($password) {
-        if (strlen($password) < 6) jsonError('Senha deve ter no minimo 6 caracteres');
-        $passwordHash = password_hash($password, PASSWORD_DEFAULT);
-        Database::execute(
-            "UPDATE users SET username = ?, full_name = ?, email = ?, role = ?, organization_id = ?, password_hash = ? WHERE id = ?",
-            [$username, $fullName, $email, $role, $organizationId ?: null, $passwordHash, $id]
-        );
-    } else {
-        Database::execute(
-            "UPDATE users SET username = ?, full_name = ?, email = ?, role = ?, organization_id = ? WHERE id = ?",
-            [$username, $fullName, $email, $role, $organizationId ?: null, $id]
-        );
-    }
-
-    log_audit('UPDATE', 'users', $id, ['username' => $username]);
-    jsonSuccess(null, 'Usuario atualizado');
-}
-
-function handleDeleteUser($id) {
-    if (!isAdminGap()) jsonError('Sem permissao', 403);
-
-    $user = Database::fetchOne("SELECT username FROM users WHERE id = ?", [$id]);
-    if (!$user) jsonError('Usuario nao encontrado', 404);
-
-    Database::execute("UPDATE users SET is_active = FALSE WHERE id = ?", [$id]);
-    log_audit('DELETE', 'users', $id, ['username' => $user['username']]);
-    jsonSuccess(null, 'Usuario excluido');
-}
-
-function handleToggleUserStatus($id) {
-    if (!isAdminGap()) jsonError('Sem permissao', 403);
-
-    $user = Database::fetchOne("SELECT is_active, username FROM users WHERE id = ?", [$id]);
-    if (!$user) jsonError('Usuario nao encontrado', 404);
-
-    $newStatus = !$user['is_active'];
-    Database::execute("UPDATE users SET is_active = ? WHERE id = ?", [$newStatus, $id]);
-    log_audit($newStatus ? 'ACTIVATE' : 'DEACTIVATE', 'users', $id, ['username' => $user['username']]);
-    jsonSuccess(null, $newStatus ? 'Usuario ativado' : 'Usuario desativado');
-}
-
-// STATIONS
-function handleGetStations($orgId) {
-    $userOrgId = getUserOrgId();
-    $isAdmin = isAdminGap();
-
-    $where = "1=1";
-    $params = [];
-
-    if ($userOrgId !== null && !$isAdmin) {
-        $where .= " AND s.organization_id = ?";
-        $params[] = $userOrgId;
-    } elseif ($orgId) {
-        $where .= " AND s.organization_id = ?";
-        $params[] = $orgId;
-    }
-
-    $stations = Database::fetchAll(
-        "SELECT s.id, s.hostname, s.ip_address, s.mac_address, s.os_name, s.os_version,
-                s.last_checkin, s.configuration_serial, s.organization_id, o.acronym as org_acronym,
-                o.serial_config,
-                CASE
-                    WHEN s.last_checkin >= ? THEN 'online'
-                    WHEN s.last_checkin < ? AND s.last_checkin IS NOT NULL THEN 'delayed'
-                    WHEN s.last_checkin IS NULL THEN 'never'
-                    ELSE 'unknown'
-                END as connection_status,
-                CASE
-                    WHEN s.configuration_serial >= o.serial_config THEN 'updated'
-                    ELSE 'outdated'
-                END as config_status
-         FROM stations s
-         JOIN organizations o ON o.id = s.organization_id
-         WHERE {$where}
-         ORDER BY s.last_checkin DESC NULLS LAST",
-        array_merge([date('Y-m-d H:i:s', strtotime('-2 hours')), date('Y-m-d H:i:s', strtotime('-2 hours'))], $params)
-    );
-
-    jsonSuccess($stations);
-}
-
-function handleStationCheckin($input) {
-    $hostname = sanitizeInput($input['hostname'] ?? '');
-    $ipAddress = sanitizeInput($input['ip_address'] ?? '');
-    $macAddress = sanitizeInput($input['mac_address'] ?? '');
-    $osName = sanitizeInput($input['os_name'] ?? '');
-    $osVersion = sanitizeInput($input['os_version'] ?? '');
-    $configSerial = (int)($input['configuration_serial'] ?? 0);
-    $orgAcronym = strtoupper(sanitizeInput($input['organization_acronym'] ?? ''));
-    $stationToken = sanitizeInput($input['station_token'] ?? '');
-
-    if (empty($hostname)) {
-        jsonError('Hostname obrigatorio');
-    }
-
-    // Look up existing station: by token first, then by hostname+mac
-    $existing = null;
-    if (!empty($stationToken)) {
-        $existing = Database::fetchOne(
-            "SELECT id, organization_id FROM stations WHERE token = ?",
-            [$stationToken]
-        );
-    }
-    if (!$existing) {
-        $existing = Database::fetchOne(
-            "SELECT id, organization_id FROM stations WHERE hostname = ?" .
-            (!empty($macAddress) ? " AND (mac_address = ? OR mac_address IS NULL OR mac_address = '')" : ""),
-            !empty($macAddress) ? [$hostname, $macAddress] : [$hostname]
-        );
-    }
-
-    $isNew = false;
-    $newToken = null;
-
-    if ($existing) {
-        $organizationId = (int)$existing['organization_id'];
-        Database::execute(
-            "UPDATE stations SET ip_address = ?, mac_address = ?, os_name = ?, os_version = ?, configuration_serial = ?, last_checkin = CURRENT_TIMESTAMP WHERE id = ?",
-            [$ipAddress, $macAddress, $osName, $osVersion, $configSerial, $existing['id']]
-        );
-        $stationId = $existing['id'];
-    } else {
-        // New station — organization_acronym is required
-        if (empty($orgAcronym)) {
-            jsonError('Informe o acronimo da organizacao (--org) no primeiro check-in', 400);
+// painel/dashboard.php - Painel Administrativo Refatorado
+if (session_status() === PHP_SESSION_NONE) session_start();
+if (!isset($_SESSION['user_id'])) header('Location: /login');
+$csrf_token = $_SESSION['csrf_token'] ?? '';
+$username = $_SESSION['username'] ?? 'Admin';
+?>
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel — SeederLinux Lite</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .sidebar-responsive { transition: transform 0.3s ease; }
+        .sidebar-open { transform: translateX(0); }
+        .sidebar-closed { transform: translateX(-100%); }
+        .fade-in { animation: fadeIn 0.3s ease; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .skeleton { background: linear-gradient(90deg, #f3f4f6 25%, #e5e7eb 50%, #f3f4f6 75%); background-size: 200% 100%; animation: loading 1.5s infinite; }
+        @keyframes loading { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+        .nav-item.active { @apply bg-blue-50 text-blue-600 border-l-4 border-blue-600; }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen flex">
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="fixed bottom-4 right-4 z-50 space-y-3"></div>
+
+    <!-- Mobile Menu Button -->
+    <button id="mobile-menu-btn" class="fixed top-4 left-4 z-40 md:hidden bg-white p-2 rounded-lg shadow-md border border-gray-200">
+        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+        </svg>
+    </button>
+
+    <!-- Sidebar -->
+    <aside id="sidebar" class="w-64 bg-white shadow-lg flex flex-col min-h-screen fixed top-0 left-0 z-30 md:relative md:z-0 md:translate-x-0 sidebar-responsive sidebar-closed md:sidebar-open">
+        <div class="px-6 py-5 border-b border-gray-200 bg-gradient-to-r from-blue-50 to-indigo-50">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 bg-gradient-to-br from-blue-600 to-blue-700 rounded-lg flex items-center justify-center shadow-md">
+                    <svg class="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 12h14M12 5l7 7-7 7"/>
+                    </svg>
+                </div>
+                <div>
+                    <span class="font-bold text-gray-900 text-sm block">SeederLinux Lite</span>
+                    <span class="text-xs text-gray-500">Admin Panel</span>
+                </div>
+            </div>
+        </div>
+
+        <nav class="flex-1 px-3 py-5 space-y-2 overflow-y-auto">
+            <p class="text-xs font-bold text-gray-400 uppercase tracking-wider px-3 mb-3">Menu Principal</p>
+            <button onclick="showSection('dashboard')" class="nav-item active w-full text-left flex items-center gap-3 px-4 py-3 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition-all">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+                </svg>
+                <span>Dashboard</span>
+            </button>
+            <button onclick="showSection('organizations')" class="nav-item w-full text-left flex items-center gap-3 px-4 py-3 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition-all">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-2 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>
+                </svg>
+                <span>Organizações</span>
+            </button>
+            <button onclick="showSection('variables')" class="nav-item w-full text-left flex items-center gap-3 px-4 py-3 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition-all">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H5a2 2 0 00-2 2v10a2 2 0 002 2h5M16 6h5a2 2 0 012 2v10a2 2 0 01-2 2h-5m-4-6h8m-8-4h8"/>
+                </svg>
+                <span>Variáveis</span>
+            </button>
+            <button onclick="showSection('bundle-generator')" class="nav-item w-full text-left flex items-center gap-3 px-4 py-3 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition-all">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                <span>Gerar Bundle</span>
+            </button>
+            <button onclick="showSection('inventory')" class="nav-item w-full text-left flex items-center gap-3 px-4 py-3 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition-all">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10h2m-2 0a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2m3 4H9"/>
+                </svg>
+                <span>Inventário</span>
+            </button>
+            <button onclick="showSection('logs')" class="nav-item w-full text-left flex items-center gap-3 px-4 py-3 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition-all">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                </svg>
+                <span>Logs</span>
+            </button>
+            <button onclick="showSection('settings')" class="nav-item w-full text-left flex items-center gap-3 px-4 py-3 rounded-lg text-sm text-gray-600 hover:bg-gray-50 transition-all">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/>
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                </svg>
+                <span>Configurações</span>
+            </button>
+        </nav>
+
+        <div class="px-4 py-4 border-t border-gray-200 bg-gray-50">
+            <div class="flex items-center gap-3 mb-4">
+                <div class="w-10 h-10 bg-gradient-to-br from-blue-400 to-blue-600 rounded-full flex items-center justify-center text-white font-bold text-sm">
+                    <?= strtoupper(substr($username, 0, 1)) ?>
+                </div>
+                <div class="flex-1 min-w-0">
+                    <p class="text-sm font-semibold text-gray-900 truncate"><?= htmlspecialchars($username) ?></p>
+                    <p class="text-xs text-gray-500">Administrador</p>
+                </div>
+            </div>
+            <a href="/logout" class="w-full flex items-center justify-center gap-2 text-red-600 hover:text-red-700 font-medium text-sm py-2 px-3 rounded-lg hover:bg-red-50 transition-colors">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+                </svg>
+                Sair
+            </a>
+        </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="flex-1 md:ml-0 min-h-screen">
+        <header class="bg-white border-b border-gray-200 px-4 sm:px-6 py-4 flex items-center justify-between sticky top-0 z-20 shadow-sm">
+            <div>
+                <h1 id="page-title" class="text-xl sm:text-2xl font-bold text-gray-900">Dashboard</h1>
+                <p id="page-subtitle" class="text-xs sm:text-sm text-gray-500 mt-0.5">Visão geral do sistema</p>
+            </div>
+            <div class="flex items-center gap-3">
+                <span class="inline-flex items-center gap-1.5 bg-green-50 text-green-700 text-xs font-semibold px-3 py-1.5 rounded-full border border-green-200">
+                    <span class="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
+                    Online
+                </span>
+            </div>
+        </header>
+
+        <!-- Dashboard Section -->
+        <section id="section-dashboard" class="p-4 sm:p-6 fade-in">
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                <div class="bg-white rounded-xl p-5 shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-500 font-medium">Total de OMs</p>
+                            <p id="stat-orgs" class="text-3xl font-bold text-blue-600 mt-2">—</p>
+                        </div>
+                        <div class="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center">
+                            <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-9 0H3m2 0h5M9 7h1m-1 4h1m4-4h1m-1 4h1m-2 10v-5a1 1 0 011-1h2a1 1 0 011 1v5m-4 0h4"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-white rounded-xl p-5 shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-500 font-medium">Bundles Gerados</p>
+                            <p id="stat-bundles" class="text-3xl font-bold text-green-600 mt-2">—</p>
+                        </div>
+                        <div class="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center">
+                            <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-white rounded-xl p-5 shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-500 font-medium">Máquinas Ativas</p>
+                            <p id="stat-machines" class="text-3xl font-bold text-purple-600 mt-2">—</p>
+                        </div>
+                        <div class="w-12 h-12 bg-purple-100 rounded-lg flex items-center justify-center">
+                            <svg class="w-6 h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17V7m0 10a2 2 0 01-2 2H5a2 2 0 01-2-2V7a2 2 0 012-2h2a2 2 0 012 2m0 10h2m-2 0a2 2 0 002 2h2a2 2 0 002-2V7a2 2 0 00-2-2h-2a2 2 0 00-2 2m3 4H9"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+                <div class="bg-white rounded-xl p-5 shadow-sm border border-gray-100 hover:shadow-md transition-shadow">
+                    <div class="flex items-center justify-between">
+                        <div>
+                            <p class="text-sm text-gray-500 font-medium">Atividades (24h)</p>
+                            <p id="stat-activities" class="text-3xl font-bold text-orange-600 mt-2">—</p>
+                        </div>
+                        <div class="w-12 h-12 bg-orange-100 rounded-lg flex items-center justify-center">
+                            <svg class="w-6 h-6 text-orange-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                            </svg>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+                <h3 class="font-bold text-gray-900 mb-4 flex items-center gap-2">
+                    <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                    Atividades Recentes
+                </h3>
+                <div id="recent-activities-table" class="text-gray-400 text-sm">Carregando...</div>
+            </div>
+        </section>
+
+        <!-- Organizations Section -->
+        <section id="section-organizations" class="p-4 sm:p-6 hidden fade-in">
+            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 mb-6">
+                <div>
+                    <h2 class="text-2xl font-bold text-gray-900">Organizações Militares</h2>
+                    <p class="text-sm text-gray-500 mt-1">Gerenciar OMs, variáveis e configurações</p>
+                </div>
+                <button onclick="openNewOmModal()" class="bg-blue-600 text-white font-semibold px-5 py-2.5 rounded-lg hover:bg-blue-700 transition-all flex items-center gap-2 shadow-md hover:shadow-lg w-full sm:w-auto justify-center">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+                    </svg>
+                    Nova OM
+                </button>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+                <table class="w-full text-sm">
+                    <thead class="bg-gray-50 border-b border-gray-200">
+                        <tr>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Nome</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Sigla</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Domínio</th>
+                            <th class="text-right px-5 py-3 text-xs font-bold text-gray-600 uppercase">Ações</th>
+                        </tr>
+                    </thead>
+                    <tbody id="orgs-table-body" class="divide-y divide-gray-100">
+                        <tr><td colspan="4" class="px-5 py-8 text-center text-gray-400">Carregando...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Variables Section -->
+        <section id="section-variables" class="p-4 sm:p-6 hidden fade-in">
+            <div class="mb-6">
+                <h2 class="text-2xl font-bold text-gray-900">Editar Variáveis</h2>
+                <p class="text-sm text-gray-500 mt-1">Configure placeholders para cada organização</p>
+            </div>
+
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6 mb-6">
+                <label class="block text-sm font-semibold text-gray-700 mb-3">Selecione a Organização</label>
+                <select id="var-org-select" class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <option value="">Carregando...</option>
+                </select>
+            </div>
+
+            <div id="variables-form-container" class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+                <p class="text-gray-400 text-sm">Selecione uma organização para editar suas variáveis</p>
+            </div>
+        </section>
+
+        <!-- Bundle Generator Section -->
+        <section id="section-bundle-generator" class="p-4 sm:p-6 hidden fade-in">
+            <div class="mb-6">
+                <h2 class="text-2xl font-bold text-gray-900">Gerar Bundle</h2>
+                <p class="text-sm text-gray-500 mt-1">Crie um arquivo .sh personalizado para uma OM</p>
+            </div>
+
+            <div class="grid lg:grid-cols-3 gap-6">
+                <!-- Form -->
+                <div class="lg:col-span-2">
+                    <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+                        <form id="bundle-form" class="space-y-5">
+                            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                            
+                            <div>
+                                <label class="block text-sm font-semibold text-gray-700 mb-2">Organização *</label>
+                                <select id="bundle-org-select" name="organization_id" required class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+                                    <option value="">Selecione uma OM...</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label class="block text-sm font-semibold text-gray-700 mb-2">Scripts a Incluir</label>
+                                <div class="space-y-2">
+                                    <label class="flex items-center gap-3 p-3 border border-gray-200 rounded-lg hover:bg-gray-50 cursor-pointer">
+                                        <input type="checkbox" name="scripts" value="core_domain" checked class="w-4 h-4 text-blue-600 rounded">
+                                        <span class="text-sm font-medium text-gray-700">core_domain.sh</span>
+                                        <span class="text-xs text-gray-500">(AD)</span>
+                                    </label>
+                                    <label class="flex items-center gap-3 p-3 border border-gray-200 rounded-lg hover:bg-gray-50 cursor-pointer">
+                                        <input type="checkbox" name="scripts" value="core_network" checked class="w-4 h-4 text-blue-600 rounded">
+                                        <span class="text-sm font-medium text-gray-700">core_network.sh</span>
+                                        <span class="text-xs text-gray-500">(Proxy/Impressão)</span>
+                                    </label>
+                                    <label class="flex items-center gap-3 p-3 border border-gray-200 rounded-lg hover:bg-gray-50 cursor-pointer">
+                                        <input type="checkbox" name="scripts" value="core_inventory" checked class="w-4 h-4 text-blue-600 rounded">
+                                        <span class="text-sm font-medium text-gray-700">core_inventory.sh</span>
+                                        <span class="text-xs text-gray-500">(OCS)</span>
+                                    </label>
+                                    <label class="flex items-center gap-3 p-3 border border-gray-200 rounded-lg hover:bg-gray-50 cursor-pointer">
+                                        <input type="checkbox" name="scripts" value="core_branding" checked class="w-4 h-4 text-blue-600 rounded">
+                                        <span class="text-sm font-medium text-gray-700">core_branding.sh</span>
+                                        <span class="text-xs text-gray-500">(Visual)</span>
+                                    </label>
+                                </div>
+                            </div>
+
+                            <div class="pt-4 border-t border-gray-200 flex gap-3">
+                                <button type="button" onclick="previewBundle()" class="flex-1 border border-gray-300 text-gray-700 font-semibold py-2.5 rounded-lg hover:bg-gray-50 transition-colors flex items-center justify-center gap-2">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                                    </svg>
+                                    Preview
+                                </button>
+                                <button type="submit" class="flex-1 bg-blue-600 text-white font-semibold py-2.5 rounded-lg hover:bg-blue-700 transition-all flex items-center justify-center gap-2 shadow-md">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                    </svg>
+                                    <span id="submit-btn-text">Gerar Bundle</span>
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Info -->
+                <div class="bg-blue-50 rounded-xl border border-blue-200 p-6 h-fit">
+                    <h4 class="font-bold text-blue-900 mb-3 flex items-center gap-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                        Como Funciona
+                    </h4>
+                    <ul class="text-sm text-blue-900 space-y-2">
+                        <li class="flex gap-2">
+                            <span class="font-bold">1.</span>
+                            <span>Selecione a OM</span>
+                        </li>
+                        <li class="flex gap-2">
+                            <span class="font-bold">2.</span>
+                            <span>Escolha os scripts</span>
+                        </li>
+                        <li class="flex gap-2">
+                            <span class="font-bold">3.</span>
+                            <span>Visualize o resultado</span>
+                        </li>
+                        <li class="flex gap-2">
+                            <span class="font-bold">4.</span>
+                            <span>Baixe o arquivo .sh</span>
+                        </li>
+                        <li class="flex gap-2">
+                            <span class="font-bold">5.</span>
+                            <span>Execute nas estações</span>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <!-- Inventory Section -->
+        <section id="section-inventory" class="p-4 sm:p-6 hidden fade-in">
+            <div class="mb-6">
+                <h2 class="text-2xl font-bold text-gray-900">Inventário de Máquinas</h2>
+                <p class="text-sm text-gray-500 mt-1">Máquinas provisionadas e seus dados de hardware</p>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead class="bg-gray-50 border-b border-gray-200">
+                        <tr>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Hostname</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">IP</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">OM</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">CPU</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">RAM</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Disco</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Agente</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Último Check-in</th>
+                        </tr>
+                    </thead>
+                    <tbody id="inventory-table-body" class="divide-y divide-gray-100">
+                        <tr><td colspan="8" class="px-5 py-8 text-center text-gray-400">Carregando...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Logs Section -->
+        <section id="section-logs" class="p-4 sm:p-6 hidden fade-in">
+            <div class="mb-6">
+                <h2 class="text-2xl font-bold text-gray-900">Logs de Atividade</h2>
+                <p class="text-sm text-gray-500 mt-1">Histórico de ações do sistema</p>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead class="bg-gray-50 border-b border-gray-200">
+                        <tr>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Data/Hora</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Usuário</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Ação</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">Detalhes</th>
+                            <th class="text-left px-5 py-3 text-xs font-bold text-gray-600 uppercase">IP</th>
+                        </tr>
+                    </thead>
+                    <tbody id="logs-table-body" class="divide-y divide-gray-100">
+                        <tr><td colspan="5" class="px-5 py-8 text-center text-gray-400">Carregando...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Settings Section -->
+        <section id="section-settings" class="p-4 sm:p-6 hidden fade-in">
+            <div class="mb-6">
+                <h2 class="text-2xl font-bold text-gray-900">Configurações do Sistema</h2>
+                <p class="text-sm text-gray-500 mt-1">Parâmetros globais</p>
+            </div>
+            <div class="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
+                <form id="settings-form" class="space-y-5">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <div id="settings-grid" class="space-y-5">
+                        <p class="text-gray-400 text-sm">Carregando...</p>
+                    </div>
+                    <div class="flex justify-end pt-4 border-t border-gray-200">
+                        <button type="submit" class="bg-blue-600 text-white font-semibold py-2.5 px-6 rounded-lg hover:bg-blue-700 transition-all flex items-center gap-2 shadow-md">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                            </svg>
+                            <span id="settings-submit-text">Salvar Configurações</span>
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </section>
+    </main>
+
+    <!-- Modal: Nova OM -->
+    <div id="modal-new-om" class="hidden fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl shadow-2xl w-full max-w-md">
+            <div class="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
+                <h3 class="font-bold text-gray-900 text-lg">Nova Organização</h3>
+                <button onclick="closeNewOmModal()" class="text-gray-400 hover:text-gray-600">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                </button>
+            </div>
+            <form id="form-new-om" class="p-6 space-y-4">
+                <div>
+                    <label class="block text-sm font-semibold text-gray-700 mb-1.5">Nome Completo *</label>
+                    <input type="text" id="om-name" required class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Ex: Comando Aéreo Regional">
+                </div>
+                <div>
+                    <label class="block text-sm font-semibold text-gray-700 mb-1.5">Sigla *</label>
+                    <input type="text" id="om-acronym" required class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Ex: COMARA">
+                </div>
+                <div>
+                    <label class="block text-sm font-semibold text-gray-700 mb-1.5">Domínio AD</label>
+                    <input type="text" id="om-domain" class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Ex: comara.intraer">
+                </div>
+                <div id="om-form-error" class="hidden text-sm text-red-600 bg-red-50 px-4 py-2.5 rounded-lg border border-red-200"></div>
+                <div class="flex gap-3 pt-2">
+                    <button type="button" onclick="closeNewOmModal()" class="flex-1 border border-gray-300 text-gray-700 font-semibold py-2.5 rounded-lg hover:bg-gray-50 transition-colors">Cancelar</button>
+                    <button type="submit" class="flex-1 bg-blue-600 text-white font-semibold py-2.5 rounded-lg hover:bg-blue-700 transition-colors">Criar OM</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        const CSRF_TOKEN = '<?= htmlspecialchars($csrf_token) ?>';
+
+        // Toast Notification System
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            const bgColor = {
+                'success': 'bg-green-50 border-green-200 text-green-800',
+                'error': 'bg-red-50 border-red-200 text-red-800',
+                'info': 'bg-blue-50 border-blue-200 text-blue-800',
+                'warning': 'bg-yellow-50 border-yellow-200 text-yellow-800'
+            }[type] || 'bg-blue-50 border-blue-200 text-blue-800';
+            
+            const icon = {
+                'success': '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>',
+                'error': '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>',
+                'info': '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>',
+                'warning': '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4v2m0 0v2m0-2v-2m0 0V9m0 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>'
+            }[type] || '<svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>';
+
+            toast.className = `border rounded-lg p-4 flex items-center gap-3 shadow-lg animate-fade-in ${bgColor}`;
+            toast.innerHTML = `${icon}<span class="text-sm font-medium">${message}</span>`;
+            container.appendChild(toast);
+            setTimeout(() => toast.remove(), 4000);
         }
 
-        $org = Database::fetchOne(
-            "SELECT id FROM organizations WHERE UPPER(acronym) = ? AND is_active = TRUE",
-            [$orgAcronym]
-        );
+        // Mobile Menu
+        document.getElementById('mobile-menu-btn').addEventListener('click', () => {
+            const sidebar = document.getElementById('sidebar');
+            sidebar.classList.toggle('sidebar-closed');
+            sidebar.classList.toggle('sidebar-open');
+        });
 
-        if (!$org) {
-            jsonError("Organizacao nao encontrada: $orgAcronym", 404);
+        // Section Navigation
+        function showSection(name) {
+            document.querySelectorAll('section[id^="section-"]').forEach(s => s.classList.add('hidden'));
+            document.getElementById('section-' + name).classList.remove('hidden');
+            document.querySelectorAll('.nav-item').forEach(a => a.classList.remove('active'));
+            event.target.closest('.nav-item').classList.add('active');
+
+            const titles = {
+                dashboard: ['Dashboard', 'Visão geral do sistema'],
+                organizations: ['Organizações (OMs)', 'Gerenciar organizações militares'],
+                variables: ['Editar Variáveis', 'Configure placeholders por OM'],
+                'bundle-generator': ['Gerar Bundle', 'Crie arquivos .sh personalizados'],
+                inventory: ['Inventário de Máquinas', 'Máquinas provisionadas'],
+                logs: ['Logs de Atividade', 'Histórico de ações'],
+                settings: ['Configurações', 'Parâmetros do sistema']
+            };
+            document.getElementById('page-title').textContent = titles[name][0];
+            document.getElementById('page-subtitle').textContent = titles[name][1];
+
+            if (name === 'dashboard') loadDashboard();
+            else if (name === 'organizations') loadOrganizations();
+            else if (name === 'variables') loadVariablesForm();
+            else if (name === 'bundle-generator') loadBundleForm();
+            else if (name === 'inventory') loadInventory();
+            else if (name === 'logs') loadLogs();
+            else if (name === 'settings') loadSettings();
         }
 
-        $organizationId = (int)$org['id'];
-        $newToken = bin2hex(random_bytes(32));
-        $isNew = true;
+        async function loadDashboard() {
+            const orgs = await apiFetch('/api/organizations.php');
+            document.getElementById('stat-orgs').textContent = orgs.length || 0;
+            
+            const inventory = await apiFetch('/api/machine_inventory.php');
+            document.getElementById('stat-machines').textContent = inventory.length || 0;
 
-        Database::execute(
-            "INSERT INTO stations (hostname, ip_address, mac_address, os_name, os_version, organization_id, configuration_serial, last_checkin, token)
-             VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)",
-            [$hostname, $ipAddress, $macAddress, $osName, $osVersion, $organizationId, $configSerial, $newToken]
-        );
-        $stationId = Database::lastInsertId();
-    }
+            const logs = await apiFetch('/api/activity_log.php?limit=10');
+            document.getElementById('stat-activities').textContent = logs.length || 0;
 
-    $orgRow = Database::fetchOne("SELECT serial_config FROM organizations WHERE id = ?", [$organizationId]);
-    $latestBundle = Database::fetchOne(
-        "SELECT id FROM deploy_bundles WHERE organization_id = ? ORDER BY generated_at DESC LIMIT 1",
-        [$organizationId]
-    );
-    $orgSerial = (int)($orgRow['serial_config'] ?? 0);
+            const tbody = document.getElementById('recent-activities-table');
+            if (logs.length === 0) {
+                tbody.innerHTML = '<p class="text-gray-400 text-sm">Nenhuma atividade registrada.</p>';
+                return;
+            }
+            tbody.innerHTML = `<table class="w-full text-sm"><thead class="bg-gray-50 border-b"><tr><th class="text-left px-4 py-2 text-xs font-bold text-gray-600">Data/Hora</th><th class="text-left px-4 py-2 text-xs font-bold text-gray-600">Usuário</th><th class="text-left px-4 py-2 text-xs font-bold text-gray-600">Ação</th></tr></thead><tbody class="divide-y divide-gray-100">${logs.slice(0, 5).map(l => `<tr class="hover:bg-gray-50"><td class="px-4 py-2 text-gray-500 text-xs">${new Date(l.timestamp).toLocaleString('pt-BR')}</td><td class="px-4 py-2 font-medium text-gray-800">${escHtml(l.username || 'Sistema')}</td><td class="px-4 py-2 text-gray-700">${escHtml(l.action)}</td></tr>`).join('')}</tbody></table>`;
+        }
 
-    $response = [
-        'status' => 'ok',
-        'station_id' => $stationId,
-        'update_available' => ($orgSerial > $configSerial),
-        'latest_bundle_id' => $latestBundle['id'] ?? null,
-        'current_serial' => $configSerial,
-        'latest_serial' => $orgSerial,
-    ];
+        async function loadOrganizations() {
+            const orgs = await apiFetch('/api/organizations.php');
+            const tbody = document.getElementById('orgs-table-body');
+            if (orgs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="px-5 py-8 text-center text-gray-400">Nenhuma organização cadastrada. <a href="#" onclick="openNewOmModal()" class="text-blue-600 font-semibold">Criar primeira OM</a></td></tr>';
+                return;
+            }
+            tbody.innerHTML = orgs.map(o => `<tr class="hover:bg-gray-50 transition-colors"><td class="px-5 py-3 font-semibold text-gray-900">${escHtml(o.name)}</td><td class="px-5 py-3"><span class="bg-blue-100 text-blue-700 text-xs font-mono font-bold px-2.5 py-1 rounded">${escHtml(o.acronym)}</span></td><td class="px-5 py-3 text-gray-500 text-sm">${escHtml(o.domain || '—')}</td><td class="px-5 py-3 text-right"><button class="text-blue-600 hover:text-blue-800 text-xs font-semibold hover:underline">Gerenciar</button></td></tr>`).join('');
+        }
 
-    if ($isNew && $newToken) {
-        $response['station_token'] = $newToken;
-    }
+        async function loadVariablesForm() {
+            const orgs = await apiFetch('/api/organizations.php');
+            const select = document.getElementById('var-org-select');
+            select.innerHTML = '<option value="">Selecione uma OM...</option>' + orgs.map(o => `<option value="${o.id}">${escHtml(o.name)} (${escHtml(o.acronym)})</option>`).join('');
+            select.addEventListener('change', loadVariablesForOrg);
+        }
 
-    jsonSuccess($response, 'Check-in registrado');
-}
+        async function loadVariablesForOrg() {
+            const orgId = document.getElementById('var-org-select').value;
+            if (!orgId) return;
+            const variables = await apiFetch(`/api/variables.php?organization_id=${orgId}`);
+            const container = document.getElementById('variables-form-container');
+            if (variables.length === 0) {
+                container.innerHTML = '<p class="text-gray-400 text-sm">Nenhuma variável para esta OM.</p>';
+                return;
+            }
+            container.innerHTML = `<form id="variables-edit-form" class="space-y-4">${variables.map(v => `<div><label class="block text-sm font-semibold text-gray-700 mb-1.5">${escHtml(v.variable_key)}</label><input type="text" name="${escHtml(v.variable_key)}" value="${escHtml(v.variable_value || '')}" class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"><p class="text-xs text-gray-500 mt-1">${escHtml(v.description || '')}</p></div>`).join('')}<div class="flex gap-3 pt-4 border-t border-gray-200"><button type="button" onclick="showSection('variables')" class="flex-1 border border-gray-300 text-gray-700 font-semibold py-2.5 rounded-lg hover:bg-gray-50">Cancelar</button><button type="submit" class="flex-1 bg-blue-600 text-white font-semibold py-2.5 rounded-lg hover:bg-blue-700">Salvar Variáveis</button></div></form>`;
+            document.getElementById('variables-edit-form').addEventListener('submit', saveVariables);
+        }
 
-// AUDIT
-function handleGetAuditEvents() {
-    if (!isAdminGap() && !isAuditor()) jsonError('Sem permissao', 403);
+        async function saveVariables(e) {
+            e.preventDefault();
+            const orgId = document.getElementById('var-org-select').value;
+            const formData = new FormData(e.target);
+            for (const [key, value] of formData.entries()) {
+                await apiFetch('/api/variables.php', 'POST', { csrf_token: CSRF_TOKEN, organization_id: orgId, variable_key: key, variable_value: value });
+            }
+            showToast('Variáveis salvas com sucesso!', 'success');
+            loadVariablesForOrg();
+        }
 
-    $limit = (int)($_GET['limit'] ?? 100);
-    $orgId = isset($_GET['org_id']) ? (int)$_GET['org_id'] : null;
-    $startDate = sanitizeInput($_GET['start_date'] ?? '');
-    $endDate = sanitizeInput($_GET['end_date'] ?? '');
+        async function loadBundleForm() {
+            const orgs = await apiFetch('/api/organizations.php');
+            const select = document.getElementById('bundle-org-select');
+            select.innerHTML = '<option value="">Selecione uma OM...</option>' + orgs.map(o => `<option value="${o.id}">${escHtml(o.name)} (${escHtml(o.acronym)})</option>`).join('');
+        }
 
-    $where = "1=1";
-    $params = [];
+        async function previewBundle() {
+            showToast('Preview em desenvolvimento...', 'info');
+        }
 
-    if ($orgId) {
-        $where .= " AND a.organization_id = ?";
-        $params[] = $orgId;
-    }
-    if ($startDate) {
-        $where .= " AND a.created_at >= ?";
-        $params[] = $startDate . ' 00:00:00';
-    }
-    if ($endDate) {
-        $where .= " AND a.created_at <= ?";
-        $params[] = $endDate . ' 23:59:59';
-    }
+        document.getElementById('bundle-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = e.target.querySelector('button[type="submit"]');
+            btn.disabled = true;
+            btn.innerHTML = '<svg class="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/></svg><span>Gerando...</span>';
+            
+            const formData = new FormData(e.target);
+            const res = await apiFetch('/api/generate-bundle.php', 'POST', Object.fromEntries(formData));
+            
+            btn.disabled = false;
+            btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg><span id="submit-btn-text">Gerar Bundle</span>';
+            
+            if (res.error) {
+                showToast(res.error, 'error');
+            } else {
+                showToast('Bundle gerado com sucesso!', 'success');
+                window.location.href = `/api/bundle.php?id=${res.bundle_id}`;
+            }
+        });
 
-    $params[] = $limit;
+        async function loadInventory() {
+            const inventory = await apiFetch('/api/machine_inventory.php');
+            const tbody = document.getElementById('inventory-table-body');
+            if (inventory.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="px-5 py-8 text-center text-gray-400">Nenhuma máquina registrada.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = inventory.map(m => `<tr class="hover:bg-gray-50"><td class="px-5 py-3 font-semibold text-gray-900">${escHtml(m.hostname)}</td><td class="px-5 py-3 text-gray-500 text-sm font-mono">${escHtml(m.ip_address)}</td><td class="px-5 py-3"><span class="bg-blue-100 text-blue-700 text-xs font-mono font-bold px-2.5 py-1 rounded">${escHtml(m.organization_acronym || 'N/A')}</span></td><td class="px-5 py-3 text-gray-500 text-sm">${escHtml(m.cpu_info)}</td><td class="px-5 py-3 text-gray-500 text-sm">${m.ram_gb} GB</td><td class="px-5 py-3 text-gray-500 text-sm">${m.disk_gb} GB</td><td class="px-5 py-3 text-gray-500 text-sm">${escHtml(m.agent_version)}</td><td class="px-5 py-3 text-xs text-gray-500">${new Date(m.last_checkin).toLocaleString('pt-BR')}</td></tr>`).join('');
+        }
 
-    $events = Database::fetchAll(
-        "SELECT a.id, a.action, a.entity, a.entity_id, a.details, a.ip_address, a.created_at,
-                u.username, u.full_name, o.acronym as org_acronym
-         FROM audit_events a
-         LEFT JOIN users u ON u.id = a.user_id
-         LEFT JOIN organizations o ON o.id = a.organization_id
-         WHERE {$where}
-         ORDER BY a.created_at DESC
-         LIMIT ?",
-        $params
-    );
+        async function loadLogs() {
+            const logs = await apiFetch('/api/activity_log.php?limit=100');
+            const tbody = document.getElementById('logs-table-body');
+            if (logs.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="px-5 py-8 text-center text-gray-400">Nenhum log registrado.</td></tr>';
+                return;
+            }
+            tbody.innerHTML = logs.map(l => `<tr class="hover:bg-gray-50"><td class="px-5 py-3 text-xs text-gray-500">${new Date(l.timestamp).toLocaleString('pt-BR')}</td><td class="px-5 py-3 font-semibold text-gray-900">${escHtml(l.username || 'Sistema')}</td><td class="px-5 py-3"><span class="bg-blue-100 text-blue-700 text-xs font-bold px-2.5 py-1 rounded">${escHtml(l.action)}</span></td><td class="px-5 py-3 text-gray-500 text-sm max-w-xs truncate" title="${escHtml(l.details || '')}">${escHtml(l.details || '—')}</td><td class="px-5 py-3 text-gray-500 text-xs font-mono">${escHtml(l.ip_address)}</td></tr>`).join('');
+        }
 
-    jsonSuccess($events);
-}
+        async function loadSettings() {
+            const settings = await apiFetch('/api/settings.php');
+            const grid = document.getElementById('settings-grid');
+            grid.innerHTML = settings.map(s => `<div><label class="block text-sm font-semibold text-gray-700 mb-1.5">${escHtml(s.setting_key)}</label><input type="text" name="${escHtml(s.setting_key)}" value="${escHtml(s.setting_value || '')}" class="w-full border border-gray-300 rounded-lg px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"><p class="text-xs text-gray-500 mt-1">${escHtml(s.description || '')}</p></div>`).join('');
+        }
 
-// UPLOADS
-function handleUploadWallpaper() {
-    $orgId = (int)($_POST['organization_id'] ?? $_GET['org_id'] ?? 0);
-    if (!$orgId) jsonError('Organization ID required', 400);
+        document.getElementById('form-new-om').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const res = await apiFetch('/api/organizations.php', 'POST', {
+                csrf_token: CSRF_TOKEN,
+                name: document.getElementById('om-name').value.trim(),
+                acronym: document.getElementById('om-acronym').value.trim().toUpperCase(),
+                domain: document.getElementById('om-domain').value.trim()
+            });
 
-    $userOrgId = getUserOrgId();
-    if ($userOrgId !== null && $userOrgId !== $orgId && !isAdminGap()) {
-        jsonError('Sem permissao', 403);
-    }
+            if (res.error) {
+                document.getElementById('om-form-error').textContent = res.error;
+                document.getElementById('om-form-error').classList.remove('hidden');
+            } else {
+                closeNewOmModal();
+                showToast('Organização criada com sucesso!', 'success');
+                loadOrganizations();
+                showSection('organizations');
+            }
+        });
 
-    if (!isset($_FILES['wallpaper']) || $_FILES['wallpaper']['error'] !== UPLOAD_ERR_OK) {
-        jsonError('Nenhum arquivo enviado', 400);
-    }
+        document.getElementById('settings-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = e.target.querySelector('button[type="submit"]');
+            btn.disabled = true;
+            btn.innerHTML = '<svg class="w-4 h-4 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/></svg><span>Salvando...</span>';
+            
+            const inputs = document.querySelectorAll('#settings-grid input[name]');
+            let errors = 0;
+            for (const input of inputs) {
+                const res = await apiFetch('/api/settings.php', 'POST', {
+                    csrf_token: CSRF_TOKEN,
+                    setting_key: input.name,
+                    setting_value: input.value.trim()
+                });
+                if (res.error) errors++;
+            }
 
-    $file = $_FILES['wallpaper'];
-    $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+            btn.disabled = false;
+            btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg><span id="settings-submit-text">Salvar Configurações</span>';
+            
+            if (errors === 0) {
+                showToast('Configurações salvas com sucesso!', 'success');
+            } else {
+                showToast('Erro ao salvar algumas configurações.', 'error');
+            }
+        });
 
-    if (!in_array($file['type'], $allowedTypes)) {
-        jsonError('Tipo de arquivo invalido. Use JPG, PNG, GIF ou WebP', 400);
-    }
+        function openNewOmModal() { document.getElementById('modal-new-om').classList.remove('hidden'); }
+        function closeNewOmModal() { document.getElementById('modal-new-om').classList.add('hidden'); document.getElementById('form-new-om').reset(); document.getElementById('om-form-error').classList.add('hidden'); }
 
-    if ($file['size'] > 10 * 1024 * 1024) {
-        jsonError('Arquivo muito grande (max 10MB)', 400);
-    }
-
-    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    $filename = 'wallpaper_org' . $orgId . '_' . time() . '.' . $ext;
-    $uploadDir = __DIR__ . '/../assets/wallpapers/';
-
-    if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
-
-    if (!move_uploaded_file($file['tmp_name'], $uploadDir . $filename)) {
-        jsonError('Erro ao salvar arquivo', 500);
-    }
-
-    $thumbDir = $uploadDir . 'thumbs/';
-    if (!is_dir($thumbDir)) mkdir($thumbDir, 0755, true);
-    generateThumbnail($uploadDir . $filename, $thumbDir . $filename, 100, 70);
-
-    $wallpaperUrl = '/assets/wallpapers/' . $filename;
-
-    Database::execute(
-        "UPDATE organization_variables ov SET value = ?
-         FROM variable_definitions vd
-         WHERE ov.organization_id = ? AND ov.variable_id = vd.id AND vd.name = 'WALLPAPER_URL'",
-        [$wallpaperUrl, $orgId]
-    );
-
-    log_audit('UPLOAD', 'wallpaper', null, ['organization_id' => $orgId, 'filename' => $filename]);
-    jsonSuccess(['url' => $wallpaperUrl, 'filename' => $filename, 'thumbnail' => '/assets/wallpapers/thumbs/' . $filename], 'Wallpaper enviado');
-}
-
-function handleUploadLogo() {
-    $orgId = (int)($_POST['organization_id'] ?? $_GET['org_id'] ?? 0);
-    if (!$orgId) jsonError('Organization ID required', 400);
-
-    $userOrgId = getUserOrgId();
-    if ($userOrgId !== null && $userOrgId !== $orgId && !isAdminGap()) {
-        jsonError('Sem permissao', 403);
-    }
-
-    if (!isset($_FILES['logo']) || $_FILES['logo']['error'] !== UPLOAD_ERR_OK) {
-        jsonError('Nenhum arquivo enviado', 400);
-    }
-
-    $file = $_FILES['logo'];
-    $allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/svg+xml'];
-
-    if (!in_array($file['type'], $allowedTypes)) {
-        jsonError('Tipo de arquivo invalido', 400);
-    }
-
-    if ($file['size'] > 10 * 1024 * 1024) {
-        jsonError('Arquivo muito grande (max 10MB)', 400);
-    }
-
-    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
-    $filename = 'logo_org' . $orgId . '_' . time() . '.' . $ext;
-    $uploadDir = __DIR__ . '/../assets/logos/';
-
-    if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
-
-    if (!move_uploaded_file($file['tmp_name'], $uploadDir . $filename)) {
-        jsonError('Erro ao salvar arquivo', 500);
-    }
-
-    $logoUrl = '/assets/logos/' . $filename;
-
-    Database::execute(
-        "UPDATE organization_variables ov SET value = ?
-         FROM variable_definitions vd
-         WHERE ov.organization_id = ? AND ov.variable_id = vd.id AND vd.name = 'LOGO_URL'",
-        [$logoUrl, $orgId]
-    );
-
-    log_audit('UPLOAD', 'logo', null, ['organization_id' => $orgId, 'filename' => $filename]);
-    jsonSuccess(['url' => $logoUrl, 'filename' => $filename], 'Logo enviado');
-}
-
-function handleGetWallpapers($orgId) {
-    if (!$orgId) jsonError('org_id required', 400);
-
-    $uploadDir = __DIR__ . '/../assets/wallpapers/';
-    $thumbDir = $uploadDir . 'thumbs/';
-    $images = [];
-
-    if (is_dir($uploadDir)) {
-        foreach (scandir($uploadDir) as $file) {
-            if ($file === '.' || $file === '..' || is_dir($uploadDir . $file)) continue;
-            if (preg_match('/^wallpaper_org' . $orgId . '_/', $file) || preg_match('/^default\./', $file)) {
-                $images[] = [
-                    'filename' => $file,
-                    'url' => '/assets/wallpapers/' . $file,
-                    'thumbnail' => file_exists($thumbDir . $file) ? '/assets/wallpapers/thumbs/' . $file : '/assets/wallpapers/' . $file,
-                    'timestamp' => filemtime($uploadDir . $file)
-                ];
+        async function apiFetch(url, method = 'GET', body = null) {
+            const opts = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body) opts.body = JSON.stringify(body);
+            try {
+                const res = await fetch(url, opts);
+                return await res.json();
+            } catch (e) {
+                return { error: 'Erro de comunicação com o servidor.' };
             }
         }
-    }
 
-    usort($images, fn($a, $b) => $b['timestamp'] - $a['timestamp']);
-    jsonSuccess(['images' => $images]);
-}
-
-function handleGetLogos($orgId) {
-    if (!$orgId) jsonError('org_id required', 400);
-
-    $uploadDir = __DIR__ . '/../assets/logos/';
-    $images = [];
-
-    if (is_dir($uploadDir)) {
-        foreach (scandir($uploadDir) as $file) {
-            if ($file === '.' || $file === '..' || is_dir($uploadDir . $file)) continue;
-            if (preg_match('/^logo_org' . $orgId . '_/', $file) || preg_match('/^default\./', $file)) {
-                $images[] = [
-                    'filename' => $file,
-                    'url' => '/assets/logos/' . $file,
-                    'timestamp' => filemtime($uploadDir . $file)
-                ];
-            }
+        function escHtml(str) {
+            if (!str) return '';
+            return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
         }
-    }
 
-    usort($images, fn($a, $b) => $b['timestamp'] - $a['timestamp']);
-    jsonSuccess(['images' => $images]);
-}
+        document.addEventListener('DOMContentLoaded', () => {
+            loadDashboard();
+        });
+    </script>
+</body>
+</html>
